@@ -3,8 +3,7 @@ from discord.ext import commands, tasks
 import json
 import os
 from datetime import datetime, timedelta
-import random
-import string
+from types import SimpleNamespace  # for fake ctx when posting leaderboards
 
 # Bot setup with intents
 intents = discord.Intents.default()
@@ -76,12 +75,113 @@ def update_closer_stats(user_id, username):
     else:
         leaderboard_data['closers'][user_id]['username'] = username
 
+
+# ---------- LEADERBOARD CHANNEL HELPERS ----------
+
+async def setup_leaderboard_channels(guild: discord.Guild):
+    """
+    Create daily/weekly/monthly leaderboard channels with locked perms
+    if they don't already exist.
+    """
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            add_reactions=False,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            add_reactions=True,
+            manage_messages=True,
+        ),
+    }
+
+    async def get_or_create(name: str):
+        channel = discord.utils.get(guild.text_channels, name=name)
+        if channel is None:
+            channel = await guild.create_text_channel(
+                name,
+                overwrites=overwrites,
+                reason="Create solar leaderboard channel",
+            )
+        return channel
+
+    await get_or_create("daily-leaderboard")
+    await get_or_create("weekly-leaderboard")
+    await get_or_create("monthly-leaderboard")
+
+def get_leaderboard_channels(guild: discord.Guild):
+    """Return the daily/weekly/monthly leaderboard channels (may be None)."""
+    daily = discord.utils.get(guild.text_channels, name="daily-leaderboard")
+    weekly = discord.utils.get(guild.text_channels, name="weekly-leaderboard")
+    monthly = discord.utils.get(guild.text_channels, name="monthly-leaderboard")
+    return daily, weekly, monthly
+
+async def post_leaderboard_to_channel(channel: discord.TextChannel, timeframe: str):
+    """
+    Reuse the existing !leaderboard logic to post into any channel
+    by faking a minimal ctx object.
+    """
+    dummy_ctx = SimpleNamespace(
+        channel=channel,
+        author=channel.guild.me,
+        send=channel.send,
+    )
+    await show_leaderboard(dummy_ctx, timeframe=timeframe)
+
+async def update_leaderboards_for_guild(guild: discord.Guild):
+    """
+    Refresh daily/weekly/monthly leaderboard channels for a guild.
+    Called after sets/closes and when joining a new guild.
+    """
+    daily, weekly, monthly = get_leaderboard_channels(guild)
+
+    async def clear_and_post(channel, timeframe):
+        try:
+            await channel.purge(limit=10)
+        except discord.Forbidden:
+            print(f"No permission to purge messages in {channel.name}")
+        except discord.HTTPException as e:
+            print(f"Failed to purge messages in {channel.name}: {e}")
+        await post_leaderboard_to_channel(channel, timeframe)
+
+    if daily:
+        await clear_and_post(daily, "today")
+    if weekly:
+        await clear_and_post(weekly, "week")
+    if monthly:
+        await clear_and_post(monthly, "month")
+
+
+# ---------- EVENTS ----------
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guild(s)')
-    # Start the daily reset task
-    daily_stats_reset.start()
+
+    # Ensure every guild has the leaderboard channels and initial boards
+    for guild in bot.guilds:
+        try:
+            await setup_leaderboard_channels(guild)
+            await update_leaderboards_for_guild(guild)
+        except Exception as e:
+            print(f"Error setting up leaderboards for guild {guild.name}: {e}")
+
+    # Start the daily reset task (currently a no-op)
+    if not daily_stats_reset.is_running():
+        daily_stats_reset.start()
+
+@bot.event
+async def on_guild_join(guild):
+    """When bot is invited to a new server, set up the channels automatically."""
+    print(f"Joined new guild: {guild.name} ({guild.id})")
+    try:
+        await setup_leaderboard_channels(guild)
+        await update_leaderboards_for_guild(guild)
+    except Exception as e:
+        print(f"Error during guild join setup for {guild.name}: {e}")
 
 @bot.event
 async def on_message(message):
@@ -133,6 +233,10 @@ async def on_message(message):
         embed.set_footer(text='Use this Deal ID when closing: #closeddeal {deal_id} {kw}')
         
         await message.channel.send(embed=embed)
+
+        # Update the leaderboard channels for this guild
+        if message.guild:
+            await update_leaderboards_for_guild(message.guild)
     
     # CLOSED DEAL workflow
     elif '#closeddeal' in content or '#closed deal' in content:
@@ -148,26 +252,33 @@ async def on_message(message):
                 if part.startswith('#'):
                     # Next part should be deal ID
                     if i + 1 < len(parts):
-                        deal_id = parts[i + 1].strip()
+                        deal_id = parts[i + 1].strip().lstrip('#')
                     # Part after that should be kW
                     if i + 2 < len(parts):
                         kw_size = float(parts[i + 2].strip())
                     break
             
             if not deal_id or kw_size is None:
-                await message.channel.send('❌ Invalid format! Use: `#closeddeal {deal_id} {kw_size}`\nExample: `#closeddeal 1001 8.5`')
+                await message.channel.send(
+                    '❌ Invalid format! Use: `#closeddeal {deal_id} {kw_size}`\n'
+                    'Example: `#closeddeal 1001 8.5`'
+                )
                 return
             
             # Check if deal exists
             if deal_id not in deals_data['deals']:
-                await message.channel.send(f'❌ Deal ID #{deal_id} not found! Make sure the appointment was set first.')
+                await message.channel.send(
+                    f'❌ Deal ID #{deal_id} not found! Make sure the appointment was set first.'
+                )
                 return
             
             deal = deals_data['deals'][deal_id]
             
             # Check if already closed
             if deal['status'] == 'closed':
-                await message.channel.send(f'❌ Deal #{deal_id} was already closed by {deal["closer_name"]}!')
+                await message.channel.send(
+                    f'❌ Deal #{deal_id} was already closed by {deal["closer_name"]}!'
+                )
                 return
             
             # Update deal
@@ -190,6 +301,7 @@ async def on_message(message):
             
             # Update setter stats
             setter_id = deal['setter_id']
+            update_setter_stats(setter_id, deal['setter_name'])
             leaderboard_data['setters'][setter_id]['appointments_closed'] += 1
             leaderboard_data['setters'][setter_id]['total_kw'] += kw_size
             leaderboard_data['setters'][setter_id]['deals'].append(deal_id)
@@ -210,14 +322,24 @@ async def on_message(message):
             embed.add_field(name='🤝 Closer', value=closer_name, inline=False)
             
             await message.channel.send(embed=embed)
+
+            # Update the leaderboard channels for this guild
+            if message.guild:
+                await update_leaderboards_for_guild(message.guild)
             
         except ValueError:
-            await message.channel.send('❌ Invalid kW size! Make sure it\'s a number.\nExample: `#closeddeal 1001 8.5`')
+            await message.channel.send(
+                '❌ Invalid kW size! Make sure it\'s a number.\n'
+                'Example: `#closeddeal 1001 8.5`'
+            )
         except Exception as e:
             await message.channel.send(f'❌ Error processing deal: {str(e)}')
     
     # Allow other commands to process
     await bot.process_commands(message)
+
+
+# ---------- COMMANDS ----------
 
 @bot.command(name='leaderboard', help='Display comprehensive sales leaderboard')
 async def show_leaderboard(ctx, timeframe: str = 'all'):
@@ -329,7 +451,7 @@ async def show_leaderboard(ctx, timeframe: str = 'all'):
             setters_text += f'{medal} **{setter["name"]}** - {setter["closed"]} closed | {setter["appts_set"]} set ({setter["close_rate"]:.0f}%)\n'
         embed.add_field(name='📞 Top Setters', value=setters_text or 'No data', inline=False)
     
-    # Overall Stats
+    # Overall Stats (all time)
     total_deals = len([d for d in deals_data['deals'].values() if d['status'] == 'closed'])
     total_kw = sum(d['kw_size'] for d in deals_data['deals'].values() if d['kw_size'])
     total_revenue = sum(d['revenue'] for d in deals_data['deals'].values() if d['revenue'])
@@ -342,6 +464,7 @@ async def show_leaderboard(ctx, timeframe: str = 'all'):
     embed.set_footer(text=f'Timeframes: all, today, week, month | Use: !leaderboard [timeframe]')
     
     await ctx.send(embed=embed)
+
 
 @bot.command(name='mystats', help='View your personal stats')
 async def my_stats(ctx):
@@ -383,6 +506,7 @@ async def my_stats(ctx):
     
     await ctx.send(embed=embed)
 
+
 @bot.command(name='dealinfo', help='Get information about a specific deal')
 async def deal_info(ctx, deal_id: str):
     """Show details about a specific deal"""
@@ -410,6 +534,7 @@ async def deal_info(ctx, deal_id: str):
     embed.add_field(name='Created Date', value=datetime.fromisoformat(deal['created_at']).strftime('%Y-%m-%d %H:%M'), inline=True)
     
     await ctx.send(embed=embed)
+
 
 @bot.command(name='pendingdeals', help='Show all pending appointments')
 async def pending_deals(ctx):
@@ -439,6 +564,7 @@ async def pending_deals(ctx):
         embed.set_footer(text=f'Showing 10 of {len(pending)} pending deals')
     
     await ctx.send(embed=embed)
+
 
 @bot.command(name='todaystats', help='Show today\'s performance')
 async def today_stats(ctx):
@@ -473,10 +599,12 @@ async def today_stats(ctx):
     
     await ctx.send(embed=embed)
 
+
 @tasks.loop(hours=24)
 async def daily_stats_reset():
-    """Daily stats notification (optional - can be removed if not needed)"""
+    """Daily stats notification (optional - currently not used)"""
     pass
+
 
 @bot.command(name='help_solar', help='Show all solar tracking commands')
 async def help_solar(ctx):
@@ -513,6 +641,7 @@ async def help_solar(ctx):
     embed.set_footer(text='Built for solar sales teams 🌞')
     
     await ctx.send(embed=embed)
+
 
 # Admin commands for data management
 @bot.command(name='deletedeal', help='Delete a deal (admin only)')
@@ -555,6 +684,7 @@ async def delete_deal(ctx, deal_id: str):
     save_leaderboard(leaderboard_data)
     
     await ctx.send(f'✅ Deal #{deal_id} has been deleted and stats updated.')
+
 
 # Run the bot
 if __name__ == '__main__':
