@@ -1,992 +1,1227 @@
+import os
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, Optional, List
+
 import discord
 from discord.ext import commands, tasks
-import json
-import os
-from datetime import datetime, timedelta
-from types import SimpleNamespace  # for fake ctx when posting leaderboards
 
-# Bot setup with intents
+# -----------------------------
+# Constants / File paths
+# -----------------------------
+
+DEALS_FILE = "deals_data.json"
+LEADERBOARD_FILE = "leaderboard_data.json"
+CONFIG_FILE = "server_config.json"
+
+UTC = timezone.utc
+
+# -----------------------------
+# Intents & bot setup
+# -----------------------------
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# File to store deal data
-DEALS_FILE = 'deals_data.json'
-LEADERBOARD_FILE = 'leaderboard_data.json'
-
-
-# ---------- DATA LOAD / SAVE ----------
-
-def load_deals():
-    if os.path.exists(DEALS_FILE):
-        with open(DEALS_FILE, 'r') as f:
-            return json.load(f)
-    return {'deals': {}, 'next_id': 1000}
+# -----------------------------
+# Helpers: file I/O
+# -----------------------------
 
 
-def load_leaderboard():
-    if os.path.exists(LEADERBOARD_FILE):
-        with open(LEADERBOARD_FILE, 'r') as f:
-            return json.load(f)
-    return {'setters': {}, 'closers': {}}
-
-
-def save_deals(data):
-    with open(DEALS_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-
-def save_leaderboard(data):
-    with open(LEADERBOARD_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-
-# Initialize data
-deals_data = load_deals()
-leaderboard_data = load_leaderboard()
-
-
-def normalize_customer_name(text: str) -> str:
-    """Normalize customer name for consistent lookup."""
-    return " ".join(text.split()).strip().title()
-
-
-def generate_deal_id():
-    """Generate unique internal deal ID"""
-    deal_id = deals_data['next_id']
-    deals_data['next_id'] += 1
-    save_deals(deals_data)
-    return deal_id
-
-
-def get_display_name(user: discord.abc.User) -> str:
-    """Get a human-friendly display name (nickname if available)."""
-    return getattr(user, "display_name", user.name)
-
-
-def update_setter_stats(user_id, username):
-    """Update or create setter stats"""
-    if user_id not in leaderboard_data['setters']:
-        leaderboard_data['setters'][user_id] = {
-            'username': username,
-            'appointments_set': 0,
-            'appointments_closed': 0,
-            'total_kw': 0.0,
-            'deals': []
-        }
-    else:
-        leaderboard_data['setters'][user_id]['username'] = username
-
-
-def update_closer_stats(user_id, username):
-    """Update or create closer stats, including streak fields."""
-    if user_id not in leaderboard_data['closers']:
-        leaderboard_data['closers'][user_id] = {
-            'username': username,
-            'deals_closed': 0,
-            'total_kw': 0.0,
-            'total_revenue': 0.0,
-            'deals': [],
-            'current_streak_days': 0,
-            'best_streak_days': 0,
-            'last_closed_date': None
-        }
-    else:
-        leaderboard_data['closers'][user_id]['username'] = username
-        # Ensure streak fields exist for older data
-        closer = leaderboard_data['closers'][user_id]
-        closer.setdefault('current_streak_days', 0)
-        closer.setdefault('best_streak_days', 0)
-        closer.setdefault('last_closed_date', None)
-
-
-async def safe_dm(user: discord.abc.User, content: str):
-    """Safely DM a user; ignore if DMs are closed."""
-    if not user:
-        return
-    try:
-        await user.send(content)
-    except discord.Forbidden:
-        pass
-    except Exception as e:
-        print(f"DM error: {e}")
-
-
-# ---------- LEADERBOARD CHANNEL HELPERS ----------
-
-async def setup_leaderboard_channels(guild: discord.Guild):
-    """
-    Create daily/weekly/monthly leaderboard channels with locked perms
-    if they don't already exist.
-    """
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=False,
-            add_reactions=False,
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            add_reactions=True,
-            manage_messages=True,
-        ),
-    }
-
-    async def get_or_create(name: str):
-        channel = discord.utils.get(guild.text_channels, name=name)
-        if channel is None:
-            channel = await guild.create_text_channel(
-                name,
-                overwrites=overwrites,
-                reason="Create solar leaderboard channel",
-            )
-        return channel
-
-    await get_or_create("daily-leaderboard")
-    await get_or_create("weekly-leaderboard")
-    await get_or_create("monthly-leaderboard")
-
-
-def get_leaderboard_channels(guild: discord.Guild):
-    """Return the daily/weekly/monthly leaderboard channels (may be None)."""
-    daily = discord.utils.get(guild.text_channels, name="daily-leaderboard")
-    weekly = discord.utils.get(guild.text_channels, name="weekly-leaderboard")
-    monthly = discord.utils.get(guild.text_channels, name="monthly-leaderboard")
-    return daily, weekly, monthly
-
-
-async def post_leaderboard_to_channel(channel: discord.TextChannel, timeframe: str):
-    """
-    Reuse the existing !leaderboard logic to post into any channel
-    by faking a minimal ctx object.
-    """
-    dummy_ctx = SimpleNamespace(
-        channel=channel,
-        author=channel.guild.me,
-        send=channel.send,
-    )
-    await show_leaderboard(dummy_ctx, timeframe=timeframe)
-
-
-async def update_leaderboards_for_guild(guild: discord.Guild):
-    """
-    Refresh daily/weekly/monthly leaderboard channels for a guild.
-    Called after sets/closes and when joining a new guild.
-    """
-    daily, weekly, monthly = get_leaderboard_channels(guild)
-
-    async def clear_and_post(channel, timeframe):
+def load_json(path: str, default: Any) -> Any:
+    if os.path.exists(path):
         try:
-            await channel.purge(limit=10)
-        except discord.Forbidden:
-            print(f"No permission to purge messages in {channel.name}")
-        except discord.HTTPException as e:
-            print(f"Failed to purge messages in {channel.name}: {e}")
-        await post_leaderboard_to_channel(channel, timeframe)
-
-    if daily:
-        await clear_and_post(daily, "today")
-    if weekly:
-        await clear_and_post(weekly, "week")
-    if monthly:
-        await clear_and_post(monthly, "month")
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
 
 
-# ---------- EVENTS ----------
+def save_json(path: str, data: Any) -> None:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# deals_data structure:
+# {
+#   "deals": {
+#       "<normalized_customer_name>": {
+#           "customer_name": "John Smith",
+#           "setter_id": "123",
+#           "setter_name": "Display Name",
+#           "status": "set" | "sold" | "canceled",
+#           "created_at": "...",
+#           "closed_at": "...",
+#           "closer_id": "...",
+#           "closer_name": "...",
+#           "kw_size": 8.5
+#       },
+#       ...
+#   }
+# }
+
+deals_data = load_json(DEALS_FILE, {"deals": {}})
+
+
+# leaderboard_data structure:
+# {
+#   "setters": {
+#       "<user_id>": {
+#           "username": "Display Name",
+#           "appointments_set": int,
+#           "appointments_closed": int,
+#           "total_kw": float,
+#           "deals": [ "<normalized_customer_name>", ... ]
+#       }
+#   },
+#   "closers": {
+#       "<user_id>": {
+#           "username": "Display Name",
+#           "deals_closed": int,
+#           "total_kw": float,
+#           "total_revenue": float,
+#           "deals": [ "<normalized_customer_name>", ... ]
+#       }
+#   }
+# }
+
+leaderboard_data = load_json(
+    LEADERBOARD_FILE,
+    {"setters": {}, "closers": {}}
+)
+
+# server_config structure (per guild):
+# {
+#   "<guild_id>": {
+#       "daily_channel_id": int | null,
+#       "weekly_channel_id": int | null,
+#       "monthly_channel_id": int | null,
+#       "audit_channel_id": int | null,
+#       "daily_summary_enabled": bool,
+#       "revenue_enabled": bool,
+#       "revenue_per_kw": float,
+#       "pay_enabled": bool,
+#       "pay_mode": "percent" | "flat",
+#       "pay_setter_percent": float,
+#       "pay_closer_percent": float,
+#       "pay_setter_flat": float,
+#       "pay_closer_flat": float
+#   }
+# }
+
+server_config: Dict[str, Any] = load_json(CONFIG_FILE, {})
+
+
+def save_deals() -> None:
+    save_json(DEALS_FILE, deals_data)
+
+
+def save_leaderboard() -> None:
+    save_json(LEADERBOARD_FILE, leaderboard_data)
+
+
+def save_config() -> None:
+    save_json(CONFIG_FILE, server_config)
+
+
+# -----------------------------
+# Helpers: Guild config & channels
+# -----------------------------
+
+
+def get_guild_config(guild: discord.Guild) -> Dict[str, Any]:
+    gid = str(guild.id)
+    if gid not in server_config:
+        server_config[gid] = {
+            "daily_channel_id": None,
+            "weekly_channel_id": None,
+            "monthly_channel_id": None,
+            "audit_channel_id": None,
+            "daily_summary_enabled": True,
+            "revenue_enabled": False,
+            "revenue_per_kw": 0.0,
+            "pay_enabled": False,
+            "pay_mode": "percent",
+            "pay_setter_percent": 50.0,
+            "pay_closer_percent": 50.0,
+            "pay_setter_flat": 0.0,
+            "pay_closer_flat": 0.0,
+        }
+        save_config()
+    return server_config[gid]
+
+
+async def ensure_leaderboard_channels(guild: discord.Guild) -> None:
+    """Create daily/weekly/monthly/audit channels if missing, and lock them to bot only."""
+    cfg = get_guild_config(guild)
+
+    async def get_or_create(name: str, purpose: str) -> Optional[int]:
+        existing = discord.utils.get(guild.text_channels, name=name)
+        if existing:
+            channel = existing
+        else:
+            channel = await guild.create_text_channel(name, reason=f"Solar bot auto-created {purpose} channel")
+
+        # Lock sending to everyone except bot
+        overwrites = channel.overwrites
+        everyone = guild.default_role
+        bot_member = guild.me
+
+        overwrites[everyone] = discord.PermissionOverwrite(send_messages=False, view_channel=True)
+        overwrites[bot_member] = discord.PermissionOverwrite(send_messages=True, view_channel=True, manage_messages=True)
+        await channel.edit(overwrites=overwrites)
+
+        return channel.id
+
+    # DAILY
+    if not cfg.get("daily_channel_id"):
+        cfg["daily_channel_id"] = await get_or_create("daily-leaderboard", "daily leaderboard")
+
+    # WEEKLY
+    if not cfg.get("weekly_channel_id"):
+        cfg["weekly_channel_id"] = await get_or_create("weekly-leaderboard", "weekly leaderboard")
+
+    # MONTHLY
+    if not cfg.get("monthly_channel_id"):
+        cfg["monthly_channel_id"] = await get_or_create("monthly-leaderboard", "monthly leaderboard")
+
+    # AUDIT
+    if not cfg.get("audit_channel_id"):
+        cfg["audit_channel_id"] = await get_or_create("solar-audit-log", "audit log")
+
+    save_config()
+
+
+async def get_channel(guild: discord.Guild, channel_id: Optional[int]) -> Optional[discord.TextChannel]:
+    if not channel_id:
+        return None
+    return guild.get_channel(channel_id)
+
+
+async def send_audit(guild: discord.Guild, message: str) -> None:
+    cfg = get_guild_config(guild)
+    channel = await get_channel(guild, cfg.get("audit_channel_id"))
+    if channel:
+        await channel.send(message)
+
+
+# -----------------------------
+# Helpers: stats & names
+# -----------------------------
+
+
+def get_display_name(member: discord.Member) -> str:
+    return member.display_name or member.name
+
+
+def normalize_customer_name(raw: str) -> str:
+    return " ".join(raw.split()).strip().lower()
+
+
+def get_time_bounds(timeframe: str):
+    now = datetime.now(UTC)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if timeframe == "today":
+        return today_start
+    if timeframe == "week":
+        # Monday start
+        return today_start - timedelta(days=today_start.weekday())
+    if timeframe == "month":
+        return today_start.replace(day=1)
+    return None  # all-time
+
+
+def update_setter_stats(user_id: str, username: str) -> None:
+    setters = leaderboard_data["setters"]
+    if user_id not in setters:
+        setters[user_id] = {
+            "username": username,
+            "appointments_set": 0,
+            "appointments_closed": 0,
+            "total_kw": 0.0,
+            "deals": [],
+        }
+    else:
+        setters[user_id]["username"] = username
+
+
+def update_closer_stats(user_id: str, username: str) -> None:
+    closers = leaderboard_data["closers"]
+    if user_id not in closers:
+        closers[user_id] = {
+            "username": username,
+            "deals_closed": 0,
+            "total_kw": 0.0,
+            "total_revenue": 0.0,
+            "deals": [],
+        }
+    else:
+        closers[user_id]["username"] = username
+
+
+def get_deal_by_customer_name(customer_name: str) -> Optional[Dict[str, Any]]:
+    key = normalize_customer_name(customer_name)
+    return deals_data["deals"].get(key)
+
+
+def ensure_deal_record(customer_name: str) -> Dict[str, Any]:
+    key = normalize_customer_name(customer_name)
+    if key not in deals_data["deals"]:
+        deals_data["deals"][key] = {
+            "customer_name": customer_name,
+            "setter_id": None,
+            "setter_name": None,
+            "status": "set",
+            "created_at": datetime.now(UTC).isoformat(),
+            "closed_at": None,
+            "closer_id": None,
+            "closer_name": None,
+            "kw_size": None,
+            "revenue": None,
+        }
+    return deals_data["deals"][key]
+
+
+# -----------------------------
+# Events
+# -----------------------------
+
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    print(f'Bot is in {len(bot.guilds)} guild(s)')
-
-    # Ensure every guild has the leaderboard channels and initial boards
+    print(f"{bot.user} has connected to Discord!")
+    print(f"Bot is in {len(bot.guilds)} guild(s)")
     for guild in bot.guilds:
-        try:
-            await setup_leaderboard_channels(guild)
-            await update_leaderboards_for_guild(guild)
-        except Exception as e:
-            print(f"Error setting up leaderboards for guild {guild.name}: {e}")
-
-    # Start the daily reset task (currently a no-op)
-    if not daily_stats_reset.is_running():
-        daily_stats_reset.start()
+        await ensure_leaderboard_channels(guild)
+    daily_summary_task.start()
 
 
 @bot.event
-async def on_guild_join(guild):
-    """When bot is invited to a new server, set up the channels automatically."""
-    print(f"Joined new guild: {guild.name} ({guild.id})")
-    try:
-        await setup_leaderboard_channels(guild)
-        await update_leaderboards_for_guild(guild)
-    except Exception as e:
-        print(f"Error during guild join setup for {guild.name}: {e}")
+async def on_guild_join(guild: discord.Guild):
+    await ensure_leaderboard_channels(guild)
+    await send_audit(guild, f"✅ Solar bot joined **{guild.name}** and created leaderboard channels.")
 
 
 @bot.event
-async def on_message(message):
-    # Ignore bot's own messages
-    if message.author.bot:
+async def on_message(message: discord.Message):
+    if message.author.bot or not isinstance(message.author, discord.Member):
         return
 
     content_lower = message.content.lower()
 
-    # APPOINTMENT SET workflow - using customer name and optional assigned closer
-    if '#appointmentset' in content_lower or '#appointment set' in content_lower:
-        raw_parts = message.content.split()
-        customer_name_tokens = []
-
-        # Build a set of mention tokens so we don't treat them as name words
-        mention_tokens = set()
-        for m in message.mentions:
-            mention_tokens.add(f"<@{m.id}>")
-            mention_tokens.add(f"<@!{m.id}>")
-
-        # Find hashtag, then everything after it (excluding mentions / other hashtags) is name
-        for i, part in enumerate(raw_parts):
-            p = part.lower()
-            if p.startswith('#appointmentset') or (p.startswith('#appointment') and 'set' in p):
-                j = i + 1
-                while j < len(raw_parts):
-                    token = raw_parts[j]
-                    if token in mention_tokens:
-                        # skip mention from name
-                        j += 1
-                        continue
-                    if token.startswith('#'):
-                        break
-                    customer_name_tokens.append(token)
-                    j += 1
-                break
-
-        if not customer_name_tokens:
-            await message.channel.send(
-                "❌ I couldn't find the customer name.\n"
-                "Use: `#appointmentset First Last [@CloserOptional]`\n"
-                "Example: `#appointmentset John Smith @Mike`"
-            )
+    # -----------------------------
+    # #set Name
+    # -----------------------------
+    if "#set" in content_lower:
+        parts = message.content.split()
+        try:
+            idx = next(i for i, p in enumerate(parts) if p.lower() == "#set")
+        except StopIteration:
             await bot.process_commands(message)
             return
 
-        customer_raw = " ".join(customer_name_tokens)
-        customer_key = normalize_customer_name(customer_raw)
-
-        # Optional assigned closer = first non-bot user mention
-        assigned_closer = None
-        for m in message.mentions:
-            if not m.bot:
-                assigned_closer = m
-                break
-
-        # Check for existing open deal for this customer
-        existing = deals_data['deals'].get(customer_key)
-        if existing and existing['status'] == 'appointment_set':
-            await message.channel.send(
-                f"⚠️ There's already a pending appointment for **{customer_key}**.\n"
-                "If you need to log another one, close or delete the first deal first."
-            )
+        # Everything after #set is the customer name
+        if idx + 1 >= len(parts):
+            await message.channel.send("❌ Usage: `#set First Last` (customer name after #set)")
             await bot.process_commands(message)
             return
 
-        # Generate unique internal deal ID
-        internal_id = generate_deal_id()
-        user_id = str(message.author.id)
-        username = get_display_name(message.author)
+        raw_name = " ".join(parts[idx + 1:]).strip()
+        if len(raw_name.split()) < 2:
+            await message.channel.send("❌ Please use first and last name. Example: `#set John Smith`")
+            await bot.process_commands(message)
+            return
 
-        # Update setter stats
-        update_setter_stats(user_id, username)
-        leaderboard_data['setters'][user_id]['appointments_set'] += 1
+        member = message.author
+        display_name = get_display_name(member)
+        deal = ensure_deal_record(raw_name)
 
-        # Create deal record (keyed by customer name)
-        deals_data['deals'][customer_key] = {
-            'deal_id': internal_id,          # internal numeric ID
-            'customer_name': customer_key,   # normalized customer name
-            'setter_id': user_id,
-            'setter_name': username,
-            'assigned_closer_id': str(assigned_closer.id) if assigned_closer else None,
-            'assigned_closer_name': get_display_name(assigned_closer) if assigned_closer else None,
-            'status': 'appointment_set',
-            'created_at': datetime.now().isoformat(),
-            'closed_at': None,
-            'closer_id': None,
-            'closer_name': None,
-            'kw_size': None,
-            'revenue': None
-        }
+        deal["setter_id"] = str(member.id)
+        deal["setter_name"] = display_name
+        deal["status"] = "set"
+        deal["created_at"] = datetime.now(UTC).isoformat()
 
-        save_deals(deals_data)
-        save_leaderboard(leaderboard_data)
+        update_setter_stats(str(member.id), display_name)
+        leaderboard_data["setters"][str(member.id)]["appointments_set"] += 1
+        key = normalize_customer_name(raw_name)
+        if key not in leaderboard_data["setters"][str(member.id)]["deals"]:
+            leaderboard_data["setters"][str(member.id)]["deals"].append(key)
 
-        # Send confirmation
+        save_deals()
+        save_leaderboard()
+
         embed = discord.Embed(
-            title='🎯 Appointment Set!',
-            description=f'{message.author.mention} just set an appointment!',
+            title="🎯 Appointment Set!",
+            description=f"{member.mention} just set an appointment for **{deal['customer_name']}**",
             color=discord.Color.green(),
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(UTC),
         )
-        embed.add_field(name='Customer', value=customer_key, inline=True)
-        embed.add_field(name='Setter', value=username, inline=True)
-        embed.add_field(name='Status', value='🔔 Pending Close', inline=True)
-        if assigned_closer:
-            embed.add_field(name='Assigned Closer', value=assigned_closer.mention, inline=True)
-        embed.set_footer(
-            text='To close this deal later, use: #closeddeal First Last kW\n'
-                 'Example: #closeddeal John Smith 8.5'
-        )
+        embed.add_field(name="Customer", value=deal["customer_name"], inline=True)
+        embed.add_field(name="Setter", value=display_name, inline=True)
+        embed.add_field(name="Status", value="🔔 Pending Sale", inline=True)
+        embed.set_footer(text="Close it later with: #sold First Last <kW>")
 
         await message.channel.send(embed=embed)
+        await send_audit(message.guild, f"📝 #set by {display_name} for {deal['customer_name']}")
 
-        # DM assigned closer, if any
-        if assigned_closer:
-            guild_name = message.guild.name if message.guild else "your server"
-            dm_text = (
-                f"📅 New appointment assigned to you in **{guild_name}**\n"
-                f"Customer: **{customer_key}**\n"
-                f"Set by: **{username}**"
-            )
-            await safe_dm(assigned_closer, dm_text)
-
-        # Update the leaderboard channels for this guild
-        if message.guild:
-            await update_leaderboards_for_guild(message.guild)
-
-    # CLOSED DEAL workflow - using customer name
-    elif '#closeddeal' in content_lower or '#closed deal' in content_lower:
-        # Parse: #closeddeal First Last 8.5
-        raw_parts = message.content.split()
-
+    # -----------------------------
+    # #sold Name kW
+    # -----------------------------
+    elif "#sold" in content_lower:
+        parts = message.content.split()
         try:
-            customer_name_tokens = []
-            kw_size = None
+            idx = next(i for i, p in enumerate(parts) if p.lower() == "#sold")
+        except StopIteration:
+            await bot.process_commands(message)
+            return
 
-            for i, part in enumerate(raw_parts):
-                p = part.lower()
-                if p.startswith('#closeddeal') or (p.startswith('#closed') and 'deal' in p):
-                    remaining = raw_parts[i + 1:]
-                    if len(remaining) < 2:
-                        raise ValueError("Not enough parts after #closeddeal")
-                    # Last token should be kW, everything before is customer name
-                    kw_token = remaining[-1]
-                    kw_size = float(kw_token)
-                    customer_name_tokens = remaining[:-1]
-                    break
-
-            if not customer_name_tokens or kw_size is None:
-                await message.channel.send(
-                    '❌ Invalid format! Use: `#closeddeal First Last kW`\n'
-                    'Example: `#closeddeal John Smith 8.5`'
-                )
-                await bot.process_commands(message)
-                return
-
-            customer_raw = " ".join(customer_name_tokens)
-            customer_key = normalize_customer_name(customer_raw)
-
-            # Check if deal exists
-            if customer_key not in deals_data['deals']:
-                await message.channel.send(
-                    f'❌ No deal found for customer **{customer_key}**!\n'
-                    'Make sure the appointment was set first with `#appointmentset First Last`.'
-                )
-                await bot.process_commands(message)
-                return
-
-            deal = deals_data['deals'][customer_key]
-
-            # Check if already closed
-            if deal['status'] == 'closed':
-                await message.channel.send(
-                    f'❌ Deal for **{customer_key}** was already closed by {deal["closer_name"]}!'
-                )
-                await bot.process_commands(message)
-                return
-
-            # Update deal
-            closer_id = str(message.author.id)
-            closer_name = get_display_name(message.author)
-
-            deal['status'] = 'closed'
-            deal['closed_at'] = datetime.now().isoformat()
-            deal['closer_id'] = closer_id
-            deal['closer_name'] = closer_name
-            deal['kw_size'] = kw_size
-            deal['revenue'] = kw_size * 3.50  # Assuming $3.50/watt average
-
-            # Update closer stats (including streak)
-            update_closer_stats(closer_id, closer_name)
-            closer_data = leaderboard_data['closers'][closer_id]
-            closer_data['deals_closed'] += 1
-            closer_data['total_kw'] += kw_size
-            closer_data['total_revenue'] += deal['revenue']
-            closer_data['deals'].append(customer_key)
-
-            # Streak logic
-            today_date = datetime.now().date()
-            last_str = closer_data.get('last_closed_date')
-            if last_str:
-                last_date = datetime.fromisoformat(last_str).date()
-                delta = (today_date - last_date).days
-                if delta == 0:
-                    # same day, keep streak as is (at least 1)
-                    if closer_data['current_streak_days'] == 0:
-                        closer_data['current_streak_days'] = 1
-                elif delta == 1:
-                    closer_data['current_streak_days'] = closer_data.get('current_streak_days', 0) + 1
-                else:
-                    closer_data['current_streak_days'] = 1
-            else:
-                closer_data['current_streak_days'] = 1
-
-            closer_data['best_streak_days'] = max(
-                closer_data.get('best_streak_days', 0),
-                closer_data['current_streak_days']
-            )
-            closer_data['last_closed_date'] = today_date.isoformat()
-
-            # Update setter stats
-            setter_id = deal['setter_id']
-            update_setter_stats(setter_id, deal['setter_name'])
-            setter_data = leaderboard_data['setters'][setter_id]
-            setter_data['appointments_closed'] += 1
-            setter_data['total_kw'] += kw_size
-            setter_data['deals'].append(customer_key)
-
-            save_deals(deals_data)
-            save_leaderboard(leaderboard_data)
-
-            # Send celebration message
-            embed = discord.Embed(
-                title='🎉 DEAL CLOSED!',
-                description=f'Deal for **{customer_key}** has been closed!',
-                color=discord.Color.gold(),
-                timestamp=datetime.utcnow()
-            )
-            embed.add_field(name='💰 System Size', value=f'{kw_size} kW', inline=True)
-            embed.add_field(name='📊 Est. Revenue', value=f'${deal["revenue"]:,.2f}', inline=True)
-            embed.add_field(name='🎯 Setter', value=deal['setter_name'], inline=False)
-            embed.add_field(name='🤝 Closer', value=closer_name, inline=False)
-            embed.add_field(name='Internal Deal ID', value=f'#{deal["deal_id"]}', inline=True)
-
-            # Streak field
-            streak_text = f"{closer_data['current_streak_days']} day(s)"
-            streak_text += f" | Best: {closer_data['best_streak_days']} day(s)"
-            embed.add_field(name='🔥 Closer Streak', value=streak_text, inline=True)
-
-            # If originally assigned, show it
-            if deal.get('assigned_closer_name') and str(deal.get('assigned_closer_id')) != closer_id:
-                embed.add_field(
-                    name='Original Assignee',
-                    value=deal['assigned_closer_name'],
-                    inline=False
-                )
-
-            await message.channel.send(embed=embed)
-
-            # DM setter + closer
-            guild = message.guild
-            guild_name = guild.name if guild else "your server"
-
-            setter_member = guild.get_member(int(setter_id)) if guild else None
-            closer_member = guild.get_member(int(closer_id)) if guild else None
-
-            setter_dm = (
-                f"✅ Your appointment for **{customer_key}** just closed in **{guild_name}**!\n"
-                f"Closer: **{closer_name}**\n"
-                f"System Size: {kw_size} kW\n"
-                f"Est. Revenue: ${deal['revenue']:,.2f}"
-            )
-            closer_dm = (
-                f"🎉 You just closed **{customer_key}** in **{guild_name}**!\n"
-                f"System Size: {kw_size} kW\n"
-                f"Est. Revenue: ${deal['revenue']:,.2f}\n"
-                f"Current streak: {closer_data['current_streak_days']} day(s) "
-                f"(Best: {closer_data['best_streak_days']} day(s))"
-            )
-
-            await safe_dm(setter_member, setter_dm)
-            await safe_dm(closer_member, closer_dm)
-
-            # Update the leaderboard channels for this guild
-            if guild:
-                await update_leaderboards_for_guild(guild)
-
-        except ValueError:
+        if idx + 2 >= len(parts):
             await message.channel.send(
-                '❌ Invalid kW size! Make sure it\'s a number.\n'
-                'Example: `#closeddeal John Smith 8.5`'
+                "❌ Usage: `#sold First Last 8.5`\n"
+                "Example: `#sold John Smith 8.5`"
             )
-        except Exception as e:
-            await message.channel.send(f'❌ Error processing deal: {str(e)}')
+            await bot.process_commands(message)
+            return
 
-    # Allow other commands to process
+        # Name is everything between #sold and last token; last token is kW
+        try:
+            kw_size = float(parts[-1])
+        except ValueError:
+            await message.channel.send("❌ Last value must be the kW size. Example: `#sold John Smith 8.5`")
+            await bot.process_commands(message)
+            return
+
+        raw_name = " ".join(parts[idx + 1:-1]).strip()
+        deal = get_deal_by_customer_name(raw_name)
+        if not deal:
+            await message.channel.send(
+                f"❌ I can't find a deal for **{raw_name}**.\n"
+                "Make sure you set it first with `#set First Last`."
+            )
+            await bot.process_commands(message)
+            return
+
+        if deal["status"] == "sold":
+            await message.channel.send(
+                f"❌ This deal for **{deal['customer_name']}** is already marked as sold."
+            )
+            await bot.process_commands(message)
+            return
+
+        member = message.author
+        display_name = get_display_name(member)
+
+        deal["status"] = "sold"
+        deal["closed_at"] = datetime.now(UTC).isoformat()
+        deal["closer_id"] = str(member.id)
+        deal["closer_name"] = display_name
+        deal["kw_size"] = kw_size
+
+        # Revenue logic per guild
+        cfg = get_guild_config(message.guild)
+        revenue = None
+        if cfg.get("revenue_enabled") and cfg.get("revenue_per_kw", 0) > 0:
+            revenue = kw_size * cfg["revenue_per_kw"]
+        deal["revenue"] = revenue
+
+        # Update closer stats
+        update_closer_stats(str(member.id), display_name)
+        closer_stats = leaderboard_data["closers"][str(member.id)]
+        closer_stats["deals_closed"] += 1
+        closer_stats["total_kw"] += kw_size
+        if revenue:
+            closer_stats["total_revenue"] += revenue
+        key = normalize_customer_name(deal["customer_name"])
+        if key not in closer_stats["deals"]:
+            closer_stats["deals"].append(key)
+
+        # Update setter stats
+        if deal["setter_id"]:
+            s_id = deal["setter_id"]
+            update_setter_stats(s_id, deal["setter_name"] or "Unknown")
+            setters = leaderboard_data["setters"][s_id]
+            setters["appointments_closed"] += 1
+            setters["total_kw"] += kw_size
+            if key not in setters["deals"]:
+                setters["deals"].append(key)
+
+        save_deals()
+        save_leaderboard()
+
+        embed = discord.Embed(
+            title="🎉 DEAL SOLD!",
+            description=f"**{deal['customer_name']}** is now a closed deal!",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.add_field(name="Customer", value=deal["customer_name"], inline=True)
+        embed.add_field(name="System Size", value=f"{kw_size} kW", inline=True)
+        if revenue:
+            embed.add_field(name="Est. Revenue", value=f"${revenue:,.2f}", inline=True)
+        embed.add_field(name="Setter", value=deal["setter_name"] or "Unknown", inline=False)
+        embed.add_field(name="Closer", value=display_name, inline=False)
+
+        await message.channel.send(embed=embed)
+        await send_audit(
+            message.guild,
+            f"✅ #sold – {deal['customer_name']} | {kw_size} kW "
+            f"(Setter: {deal['setter_name']}, Closer: {display_name})"
+        )
+
+    # -----------------------------
+    # #canceled Name  (Manager/Admin only)
+    # -----------------------------
+    elif "#canceled" in content_lower:
+        # Permissions check (Manager or Admin)
+        roles = [r.name.lower() for r in message.author.roles]
+        if "admin" not in roles and "manager" not in roles:
+            await message.channel.send("❌ Only Admin or Manager can cancel deals.")
+            await bot.process_commands(message)
+            return
+
+        parts = message.content.split()
+        try:
+            idx = next(i for i, p in enumerate(parts) if p.lower() == "#canceled")
+        except StopIteration:
+            await bot.process_commands(message)
+            return
+
+        if idx + 1 >= len(parts):
+            await message.channel.send("❌ Usage: `#canceled First Last`")
+            await bot.process_commands(message)
+            return
+
+        raw_name = " ".join(parts[idx + 1:]).strip()
+        deal = get_deal_by_customer_name(raw_name)
+        if not deal:
+            await message.channel.send(f"❌ I can't find a deal for **{raw_name}**.")
+            await bot.process_commands(message)
+            return
+
+        prev_status = deal["status"]
+        key = normalize_customer_name(deal["customer_name"])
+
+        # Roll back stats depending on current status
+        if prev_status == "set":
+            if deal["setter_id"] and deal["setter_id"] in leaderboard_data["setters"]:
+                leaderboard_data["setters"][deal["setter_id"]]["appointments_set"] -= 1
+        elif prev_status == "sold":
+            kw = deal["kw_size"] or 0
+            rev = deal["revenue"] or 0
+
+            # Closer
+            if deal["closer_id"] and deal["closer_id"] in leaderboard_data["closers"]:
+                cstats = leaderboard_data["closers"][deal["closer_id"]]
+                cstats["deals_closed"] -= 1
+                cstats["total_kw"] -= kw
+                cstats["total_revenue"] -= rev
+                if key in cstats["deals"]:
+                    cstats["deals"].remove(key)
+
+            # Setter
+            if deal["setter_id"] and deal["setter_id"] in leaderboard_data["setters"]:
+                sstats = leaderboard_data["setters"][deal["setter_id"]]
+                sstats["appointments_closed"] -= 1
+                sstats["total_kw"] -= kw
+                if key in sstats["deals"]:
+                    sstats["deals"].remove(key)
+
+        deal["status"] = "canceled"
+        save_deals()
+        save_leaderboard()
+
+        embed = discord.Embed(
+            title="🚫 Deal Canceled",
+            description=f"Deal for **{deal['customer_name']}** has been canceled.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.add_field(name="Previous Status", value=prev_status, inline=True)
+        await message.channel.send(embed=embed)
+        await send_audit(
+            message.guild,
+            f"🚫 #canceled – {deal['customer_name']} (previous status: {prev_status}) "
+            f"by {get_display_name(message.author)}"
+        )
+
     await bot.process_commands(message)
 
 
-# ---------- COMMANDS ----------
+# -----------------------------
+# Commands: Revenue & pay config (DM wizard)
+# -----------------------------
 
-@bot.command(name='leaderboard', help='Display comprehensive sales leaderboard')
-async def show_leaderboard(ctx, timeframe: str = 'all'):
-    """Display the sales leaderboard with filtering options"""
 
-    # Calculate date filters
-    now = datetime.now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_start = today_start - timedelta(days=today_start.weekday())
-    month_start = today_start.replace(day=1)
+@bot.command(name="configure_revenue", help="Admin/Manager only – configure revenue & pay (DM wizard)")
+@commands.has_any_role("Admin", "Manager")
+async def configure_revenue(ctx: commands.Context):
+    """DM wizard to configure revenue + setter/closer pay."""
+    guild = ctx.guild
+    if guild is None:
+        await ctx.reply("Run this command inside the server, not in DMs.")
+        return
 
-    # Filter deals based on timeframe
-    def filter_deals_by_time(deals_list, start_date):
-        filtered = []
-        for key in deals_list:
-            if key in deals_data['deals']:
-                deal = deals_data['deals'][key]
-                if deal['closed_at'] and deal['status'] == 'closed':
-                    deal_date = datetime.fromisoformat(deal['closed_at'])
-                    if deal_date >= start_date:
-                        filtered.append(key)
-        return filtered
+    cfg = get_guild_config(guild)
 
-    # Create main embed
+    try:
+        dm = await ctx.author.create_dm()
+    except discord.Forbidden:
+        await ctx.reply("I can't DM you. Please enable DMs from server members and try again.")
+        return
+
+    await ctx.reply("📩 I just DMed you a configuration wizard for revenue & pay.")
+
+    def check(m: discord.Message) -> bool:
+        return m.author.id == ctx.author.id and m.channel.id == dm.id
+
+    try:
+        # 1) Enable revenue?
+        await dm.send(
+            "💰 **Revenue Tracking Setup**\n"
+            "Do you want to enable revenue tracking on leaderboards? (yes/no)"
+        )
+        msg = await bot.wait_for("message", check=check, timeout=120)
+        enable_rev = msg.content.strip().lower() in ["yes", "y"]
+
+        cfg["revenue_enabled"] = enable_rev
+
+        if enable_rev:
+            await dm.send(
+                "Great. How much revenue per kW?\n"
+                "Example: if revenue is $400 per kW, reply with `400`."
+            )
+            while True:
+                msg = await bot.wait_for("message", check=check, timeout=120)
+                try:
+                    per_kw = float(msg.content.strip())
+                    if per_kw <= 0:
+                        raise ValueError()
+                    cfg["revenue_per_kw"] = per_kw
+                    break
+                except ValueError:
+                    await dm.send("Please enter a positive number, like `400`.")
+
+        else:
+            cfg["revenue_per_kw"] = 0.0
+
+        # 2) Enable pay?
+        await dm.send(
+            "👥 **Setter / Closer Pay Setup**\n"
+            "Do you want me to calculate payouts for setter/closer on the manager leaderboard? (yes/no)"
+        )
+        msg = await bot.wait_for("message", check=check, timeout=120)
+        enable_pay = msg.content.strip().lower() in ["yes", "y"]
+        cfg["pay_enabled"] = enable_pay
+
+        if enable_pay:
+            await dm.send(
+                "How do you want to define pay?\n"
+                "- Type `percent` for % of revenue\n"
+                "- Type `flat` for flat dollar amounts per deal"
+            )
+            while True:
+                msg = await bot.wait_for("message", check=check, timeout=120)
+                mode = msg.content.strip().lower()
+                if mode in ["percent", "flat"]:
+                    cfg["pay_mode"] = mode
+                    break
+                await dm.send("Please reply with `percent` or `flat`.")
+
+            if cfg["pay_mode"] == "percent":
+                await dm.send(
+                    "Enter setter % and closer % of revenue.\n"
+                    "Example: `40 60` (setter 40%, closer 60%)"
+                )
+                while True:
+                    msg = await bot.wait_for("message", check=check, timeout=120)
+                    parts = msg.content.replace(",", " ").split()
+                    if len(parts) != 2:
+                        await dm.send("Please enter two numbers, like `40 60`.")
+                        continue
+                    try:
+                        s_pct = float(parts[0])
+                        c_pct = float(parts[1])
+                        if s_pct < 0 or c_pct < 0 or abs(s_pct + c_pct - 100) > 0.01:
+                            await dm.send("Percents must be >= 0 and sum to 100. Try again, e.g. `40 60`.")
+                            continue
+                        cfg["pay_setter_percent"] = s_pct
+                        cfg["pay_closer_percent"] = c_pct
+                        break
+                    except ValueError:
+                        await dm.send("Please enter valid numbers like `40 60`.")
+            else:
+                await dm.send(
+                    "Enter flat dollar amounts per deal for setter and closer.\n"
+                    "Example: `100 300` (setter $100, closer $300)"
+                )
+                while True:
+                    msg = await bot.wait_for("message", check=check, timeout=120)
+                    parts = msg.content.replace(",", " ").split()
+                    if len(parts) != 2:
+                        await dm.send("Please enter two numbers, like `100 300`.")
+                        continue
+                    try:
+                        s_flat = float(parts[0])
+                        c_flat = float(parts[1])
+                        if s_flat < 0 or c_flat < 0:
+                            await dm.send("Values must be >= 0. Try again.")
+                            continue
+                        cfg["pay_setter_flat"] = s_flat
+                        cfg["pay_closer_flat"] = c_flat
+                        break
+                    except ValueError:
+                        await dm.send("Please enter valid numbers like `100 300`.")
+
+        save_config()
+
+        summary_lines = []
+        summary_lines.append(f"Revenue enabled: **{cfg['revenue_enabled']}**")
+        if cfg["revenue_enabled"]:
+            summary_lines.append(f"Revenue per kW: **${cfg['revenue_per_kw']:.2f}**")
+
+        summary_lines.append(f"Pay enabled: **{cfg['pay_enabled']}**")
+        if cfg["pay_enabled"]:
+            if cfg["pay_mode"] == "percent":
+                summary_lines.append(
+                    f"Pay mode: **percent** – Setter {cfg['pay_setter_percent']}%, "
+                    f"Closer {cfg['pay_closer_percent']}%"
+                )
+            else:
+                summary_lines.append(
+                    f"Pay mode: **flat** – Setter ${cfg['pay_setter_flat']:.2f}, "
+                    f"Closer ${cfg['pay_closer_flat']:.2f}"
+                )
+
+        await dm.send(
+            "✅ Configuration saved.\n\n" + "\n".join(summary_lines)
+        )
+        await send_audit(guild, f"⚙️ Revenue/pay configuration updated by {get_display_name(ctx.author)}.")
+
+    except Exception as e:
+        await dm.send(f"❌ Wizard aborted or timed out.\nError: {e}")
+
+
+# -----------------------------
+# Commands: Leaderboards & stats
+# -----------------------------
+
+
+def _filter_deals_by_time(deal_keys: List[str], start_time: Optional[datetime]) -> List[str]:
+    if start_time is None:
+        return deal_keys
+    out = []
+    for key in deal_keys:
+        deal = deals_data["deals"].get(key)
+        if not deal or not deal.get("closed_at"):
+            continue
+        try:
+            closed = datetime.fromisoformat(deal["closed_at"])
+        except Exception:
+            continue
+        if closed >= start_time:
+            out.append(key)
+    return out
+
+
+@bot.command(name="leaderboard", help="Show team leaderboard (no revenue)")
+async def leaderboard(ctx: commands.Context, timeframe: str = "all"):
+    timeframe = timeframe.lower()
+    if timeframe not in ["all", "today", "week", "month"]:
+        timeframe = "all"
+
+    start_time = get_time_bounds(timeframe)
+
     embed = discord.Embed(
-        title='🏆 Solar Sales Leaderboard',
-        description=f'Performance Overview - {timeframe.upper()}',
+        title="🏆 Solar Sales Leaderboard",
+        description=f"Timeframe: **{timeframe}**",
         color=discord.Color.gold(),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC),
     )
 
-    # CLOSERS LEADERBOARD
-    closers_list = []
-    for closer_id, data in leaderboard_data['closers'].items():
-        if timeframe == 'today':
-            deals = filter_deals_by_time(data['deals'], today_start)
-        elif timeframe == 'week':
-            deals = filter_deals_by_time(data['deals'], week_start)
-        elif timeframe == 'month':
-            deals = filter_deals_by_time(data['deals'], month_start)
-        else:  # all time
-            deals = [d for d in data['deals'] if d in deals_data['deals'] and deals_data['deals'][d]['status'] == 'closed']
+    # Closers
+    closers_rows = []
+    for uid, data in leaderboard_data["closers"].items():
+        deal_keys = data["deals"]
+        filtered = _filter_deals_by_time(deal_keys, start_time)
+        deals_count = len(filtered)
+        total_kw = 0.0
+        for key in filtered:
+            d = deals_data["deals"].get(key)
+            if d and d.get("kw_size"):
+                total_kw += d["kw_size"]
+        closers_rows.append(
+            {
+                "name": data["username"],
+                "deals": deals_count,
+                "kw": total_kw,
+            }
+        )
+    closers_rows.sort(key=lambda x: (x["deals"], x["kw"]), reverse=True)
 
-        # Calculate stats for timeframe
-        total_kw = sum(
-            deals_data['deals'][d]['kw_size']
-            for d in deals
-            if d in deals_data['deals'] and deals_data['deals'][d]['kw_size']
+    # Setters
+    setters_rows = []
+    for uid, data in leaderboard_data["setters"].items():
+        deal_keys = data["deals"]
+        filtered = _filter_deals_by_time(deal_keys, start_time)
+        closed_count = len(filtered)
+
+        if start_time is None:
+            appts_set = data["appointments_set"]
+        else:
+            appts_set = 0
+            for key, d in deals_data["deals"].items():
+                if d.get("setter_id") == uid and d.get("created_at"):
+                    try:
+                        created = datetime.fromisoformat(d["created_at"])
+                    except Exception:
+                        continue
+                    if created >= start_time:
+                        appts_set += 1
+
+        close_rate = (closed_count / appts_set * 100) if appts_set > 0 else 0.0
+        setters_rows.append(
+            {
+                "name": data["username"],
+                "appts_set": appts_set,
+                "closed": closed_count,
+                "close_rate": close_rate,
+            }
+        )
+    setters_rows.sort(key=lambda x: (x["closed"], x["appts_set"]), reverse=True)
+
+    # Closers field
+    if closers_rows:
+        medals = ["🥇", "🥈", "🥉"]
+        text = ""
+        for i, row in enumerate(closers_rows[:5]):
+            medal = medals[i] if i < 3 else f"{i+1}."
+            text += f"{medal} **{row['name']}** – {row['deals']} sold | {row['kw']:.1f} kW\n"
+        embed.add_field(name="👔 Top Closers", value=text, inline=False)
+
+    # Setters field
+    if setters_rows:
+        medals = ["🥇", "🥈", "🥉"]
+        text = ""
+        for i, row in enumerate(setters_rows[:5]):
+            medal = medals[i] if i < 3 else f"{i+1}."
+            text += (
+                f"{medal} **{row['name']}** – {row['closed']} sold | "
+                f"{row['appts_set']} set ({row['close_rate']:.0f}%)\n"
+            )
+        embed.add_field(name="📞 Top Setters", value=text, inline=False)
+
+    # Overall stats (all time)
+    total_deals = 0
+    total_kw_all = 0.0
+    for d in deals_data["deals"].values():
+        if d.get("status") == "sold":
+            total_deals += 1
+            if d.get("kw_size"):
+                total_kw_all += d["kw_size"]
+
+    embed.add_field(
+        name="📊 Company Stats (All Time)",
+        value=f"💼 **Total Deals:** {total_deals}\n⚡ **Total kW:** {total_kw_all:.1f}",
+        inline=False,
+    )
+    embed.set_footer(text="Timeframes: all, today, week, month | Example: !leaderboard week")
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="managerboard", help="Manager/Admin – leaderboard with revenue & payouts")
+@commands.has_any_role("Admin", "Manager")
+async def managerboard(ctx: commands.Context, timeframe: str = "all"):
+    guild = ctx.guild
+    if guild is None:
+        await ctx.reply("Run this in the server, not in DMs.")
+        return
+
+    cfg = get_guild_config(guild)
+    timeframe = timeframe.lower()
+    if timeframe not in ["all", "today", "week", "month"]:
+        timeframe = "all"
+
+    start_time = get_time_bounds(timeframe)
+
+    embed = discord.Embed(
+        title="📊 Manager Leaderboard (Revenue + Pay)",
+        description=f"Timeframe: **{timeframe}**",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(UTC),
+    )
+
+    # Build per-closer revenue
+    rev_enabled = cfg.get("revenue_enabled", False) and cfg.get("revenue_per_kw", 0) > 0
+    pay_enabled = cfg.get("pay_enabled", False)
+
+    closer_rows = []
+    for uid, data in leaderboard_data["closers"].items():
+        deal_keys = _filter_deals_by_time(data["deals"], start_time)
+        deals_count = len(deal_keys)
+        total_kw = 0.0
+        total_rev = 0.0
+        setter_pay = 0.0
+        closer_pay = 0.0
+
+        for key in deal_keys:
+            d = deals_data["deals"].get(key)
+            if not d or d.get("status") != "sold":
+                continue
+            k = d.get("kw_size") or 0
+            total_kw += k
+            if rev_enabled:
+                r = (d.get("revenue")
+                     if d.get("revenue") is not None
+                     else k * cfg["revenue_per_kw"])
+                total_rev += r
+                if pay_enabled:
+                    if cfg["pay_mode"] == "percent":
+                        setter_pay += r * (cfg["pay_setter_percent"] / 100.0)
+                        closer_pay += r * (cfg["pay_closer_percent"] / 100.0)
+                    else:
+                        setter_pay += cfg["pay_setter_flat"]
+                        closer_pay += cfg["pay_closer_flat"]
+
+        closer_rows.append(
+            {
+                "name": data["username"],
+                "deals": deals_count,
+                "kw": total_kw,
+                "revenue": total_rev,
+                "setter_pay": setter_pay,
+                "closer_pay": closer_pay,
+            }
         )
 
-        closers_list.append({
-            'name': data['username'],
-            'deals': len(deals),
-            'kw': total_kw
-        })
+    closer_rows.sort(key=lambda x: (x["deals"], x["kw"]), reverse=True)
 
-    closers_list.sort(key=lambda x: (x['deals'], x['kw']), reverse=True)
+    text = ""
+    for i, row in enumerate(closer_rows[:10]):
+        line = f"**{i+1}. {row['name']}** – {row['deals']} sold | {row['kw']:.1f} kW"
+        if rev_enabled:
+            line += f" | Rev: ${row['revenue']:,.0f}"
+        if pay_enabled:
+            line += (
+                f" | Setter Pay: ${row['setter_pay']:,.0f}"
+                f" | Closer Pay: ${row['closer_pay']:,.0f}"
+            )
+        text += line + "\n"
 
-    # SETTERS LEADERBOARD
-    setters_list = []
-    for setter_id, data in leaderboard_data['setters'].items():
-        if timeframe == 'today':
-            deals = filter_deals_by_time(data['deals'], today_start)
-        elif timeframe == 'week':
-            deals = filter_deals_by_time(data['deals'], week_start)
-        elif timeframe == 'month':
-            deals = filter_deals_by_time(data['deals'], month_start)
-        else:  # all time
-            deals = [d for d in data['deals'] if d in deals_data['deals'] and deals_data['deals'][d]['status'] == 'closed']
+    if not text:
+        text = "No data yet."
 
-        closed_deals = len(deals)
+    embed.add_field(name="Managers View", value=text, inline=False)
 
-        # Count appointments set in timeframe
-        if timeframe == 'all':
-            appts_set = data['appointments_set']
+    settings_lines = [
+        f"Revenue enabled: **{cfg['revenue_enabled']}**",
+        f"Revenue / kW: **${cfg['revenue_per_kw']:.2f}**" if cfg["revenue_enabled"] else "",
+        f"Pay enabled: **{cfg['pay_enabled']}**",
+    ]
+
+    if cfg["pay_enabled"]:
+        if cfg["pay_mode"] == "percent":
+            settings_lines.append(
+                f"Pay mode: **percent** – Setter {cfg['pay_setter_percent']}%, "
+                f"Closer {cfg['pay_closer_percent']}%"
+            )
         else:
-            appts_set = sum(
-                1 for key, deal in deals_data['deals'].items()
-                if deal['setter_id'] == setter_id and
-                datetime.fromisoformat(deal['created_at']) >= (
-                    today_start if timeframe == 'today' else
-                    week_start if timeframe == 'week' else
-                    month_start
-                )
+            settings_lines.append(
+                f"Pay mode: **flat** – Setter ${cfg['pay_setter_flat']:.2f}, "
+                f"Closer ${cfg['pay_closer_flat']:.2f}"
             )
 
-        setters_list.append({
-            'name': data['username'],
-            'appts_set': appts_set,
-            'closed': closed_deals,
-            'close_rate': (closed_deals / appts_set * 100) if appts_set > 0 else 0
-        })
-
-    setters_list.sort(key=lambda x: (x['closed'], x['appts_set']), reverse=True)
-
-    # Add Closers to embed
-    if closers_list:
-        closers_text = ""
-        medals = ['🥇', '🥈', '🥉']
-        for i, closer in enumerate(closers_list[:5]):
-            medal = medals[i] if i < 3 else f'{i+1}.'
-            closers_text += f'{medal} **{closer["name"]}** - {closer["deals"]} deals | {closer["kw"]:.1f} kW\n'
-        embed.add_field(name='👔 Top Closers', value=closers_text or 'No data', inline=False)
-
-    # Add Setters to embed
-    if setters_list:
-        setters_text = ""
-        medals = ['🥇', '🥈', '🥉']
-        for i, setter in enumerate(setters_list[:5]):
-            medal = medals[i] if i < 3 else f'{i+1}.'
-            setters_text += f'{medal} **{setter["name"]}** - {setter["closed"]} closed | {setter["appts_set"]} set ({setter["close_rate"]:.0f}%)\n'
-        embed.add_field(name='📞 Top Setters', value=setters_text or 'No data', inline=False)
-
-    # Overall Stats (closed only, all time)
-    total_deals = len([d for d in deals_data['deals'].values() if d['status'] == 'closed'])
-    total_kw = sum(d['kw_size'] for d in deals_data['deals'].values() if d['status'] == 'closed' and d['kw_size'])
-    total_revenue = sum(d['revenue'] for d in deals_data['deals'].values() if d['status'] == 'closed' and d['revenue'])
-
-    stats_text = f"💼 **Total Closed Deals:** {total_deals}\n"
-    stats_text += f"⚡ **Total kW (Closed):** {total_kw:.1f}\n"
-    stats_text += f"💰 **Est. Revenue (Closed):** ${total_revenue:,.2f}"
-
-    embed.add_field(name='📊 Company Stats (All Time)', value=stats_text, inline=False)
-    embed.set_footer(text='Timeframes: all, today, week, month | Use: !leaderboard [timeframe]')
+    embed.add_field(
+        name="Config Snapshot",
+        value="\n".join([line for line in settings_lines if line]),
+        inline=False,
+    )
 
     await ctx.send(embed=embed)
 
 
-@bot.command(name='mystats', help='View your personal stats')
-async def my_stats(ctx):
-    """Show personal statistics"""
+@bot.command(name="mystats", help="View your personal stats")
+async def mystats(ctx: commands.Context):
     user_id = str(ctx.author.id)
-
-    display_name = get_display_name(ctx.author)
-
     embed = discord.Embed(
-        title=f'📊 Stats for {display_name}',
+        title=f"📊 Stats for {get_display_name(ctx.author)}",
         color=discord.Color.blue(),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC),
     )
 
-    # Setter stats
-    if user_id in leaderboard_data['setters']:
-        setter_data = leaderboard_data['setters'][user_id]
-        close_rate = (setter_data['appointments_closed'] / setter_data['appointments_set'] * 100) if setter_data['appointments_set'] > 0 else 0
-
-        setter_text = f"📞 **Appointments Set:** {setter_data['appointments_set']}\n"
-        setter_text += f"✅ **Closed:** {setter_data['appointments_closed']}\n"
-        setter_text += f"📈 **Close Rate:** {close_rate:.1f}%\n"
-        setter_text += f"⚡ **Total kW:** {setter_data['total_kw']:.1f}"
-
-        embed.add_field(name='Setter Performance', value=setter_text, inline=False)
-
-    # Closer stats
-    if user_id in leaderboard_data['closers']:
-        closer_data = leaderboard_data['closers'][user_id]
-        avg_kw = closer_data['total_kw'] / closer_data['deals_closed'] if closer_data['deals_closed'] > 0 else 0
-
-        closer_text = f"🤝 **Deals Closed:** {closer_data['deals_closed']}\n"
-        closer_text += f"⚡ **Total kW:** {closer_data['total_kw']:.1f}\n"
-        closer_text += f"📊 **Avg System Size:** {avg_kw:.1f} kW\n"
-        closer_text += f"💰 **Est. Revenue:** ${closer_data['total_revenue']:,.2f}\n"
-        closer_text += f"🔥 **Current Streak:** {closer_data.get('current_streak_days', 0)} day(s)\n"
-        closer_text += f"🏅 **Best Streak:** {closer_data.get('best_streak_days', 0)} day(s)"
-
-        embed.add_field(name='Closer Performance', value=closer_text, inline=False)
-
-    if user_id not in leaderboard_data['setters'] and user_id not in leaderboard_data['closers']:
-        embed.description = "No stats yet! Start setting appointments with #appointmentset"
-
-    await ctx.send(embed=embed)
-
-
-@bot.command(name='dealinfo', help='Get information about a specific deal by customer name')
-async def deal_info(ctx, *, customer_name: str):
-    """Show details about a specific deal (by customer name)"""
-    customer_key = normalize_customer_name(customer_name)
-    if customer_key not in deals_data['deals']:
-        await ctx.send(f'❌ Deal for **{customer_key}** not found!')
-        return
-
-    deal = deals_data['deals'][customer_key]
-
-    color = (
-        discord.Color.red() if deal['status'] == 'canceled'
-        else discord.Color.green() if deal['status'] == 'closed'
-        else discord.Color.orange()
-    )
-
-    embed = discord.Embed(
-        title=f'📋 Deal for {customer_key}',
-        color=color,
-        timestamp=datetime.utcnow()
-    )
-
-    embed.add_field(
-        name='Status',
-        value=(
-            '❌ Canceled' if deal['status'] == 'canceled'
-            else '✅ Closed' if deal['status'] == 'closed'
-            else '🔔 Pending'
-        ),
-        inline=True
-    )
-    embed.add_field(name='Customer', value=deal['customer_name'], inline=True)
-    embed.add_field(name='Setter', value=deal['setter_name'], inline=True)
-
-    if deal.get('assigned_closer_name'):
-        embed.add_field(name='Assigned Closer', value=deal['assigned_closer_name'], inline=True)
-
-    if deal['status'] == 'closed':
-        embed.add_field(name='Closer', value=deal['closer_name'], inline=True)
-        embed.add_field(name='System Size', value=f"{deal['kw_size']} kW", inline=True)
-        embed.add_field(name='Est. Revenue', value=f"${deal['revenue']:,.2f}", inline=True)
-        embed.add_field(
-            name='Closed Date',
-            value=datetime.fromisoformat(deal['closed_at']).strftime('%Y-%m-%d %H:%M'),
-            inline=True
+    # Setter
+    if user_id in leaderboard_data["setters"]:
+        s = leaderboard_data["setters"][user_id]
+        close_rate = (
+            s["appointments_closed"] / s["appointments_set"] * 100
+            if s["appointments_set"] > 0
+            else 0.0
         )
+        text = (
+            f"📞 **Appointments Set:** {s['appointments_set']}\n"
+            f"✅ **Closed (as setter):** {s['appointments_closed']}\n"
+            f"📈 **Close Rate:** {close_rate:.1f}%\n"
+            f"⚡ **Total kW:** {s['total_kw']:.1f}"
+        )
+        embed.add_field(name="Setter Performance", value=text, inline=False)
 
-    embed.add_field(
-        name='Created Date',
-        value=datetime.fromisoformat(deal['created_at']).strftime('%Y-%m-%d %H:%M'),
-        inline=True
-    )
-    embed.add_field(name='Internal Deal ID', value=f'#{deal["deal_id"]}', inline=True)
+    # Closer
+    if user_id in leaderboard_data["closers"]:
+        c = leaderboard_data["closers"][user_id]
+        avg_kw = c["total_kw"] / c["deals_closed"] if c["deals_closed"] > 0 else 0.0
+        text = (
+            f"🤝 **Deals Closed:** {c['deals_closed']}\n"
+            f"⚡ **Total kW:** {c['total_kw']:.1f}\n"
+            f"📊 **Avg System Size:** {avg_kw:.1f} kW"
+        )
+        embed.add_field(name="Closer Performance", value=text, inline=False)
+
+    if (
+        user_id not in leaderboard_data["setters"]
+        and user_id not in leaderboard_data["closers"]
+    ):
+        embed.description = "No stats yet – start with `#set First Last`."
 
     await ctx.send(embed=embed)
 
 
-@bot.command(name='pendingdeals', help='Show all pending appointments')
-async def pending_deals(ctx):
-    """Show all appointments that haven't been closed yet"""
-    pending = [deal for deal in deals_data['deals'].values() if deal['status'] == 'appointment_set']
+@bot.command(name="todaystats", help="Show today's performance")
+async def todaystats(ctx: commands.Context):
+    today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
+    today_set = 0
+    today_sold = 0
+    total_kw = 0.0
+
+    for d in deals_data["deals"].values():
+        if d.get("created_at"):
+            try:
+                created = datetime.fromisoformat(d["created_at"])
+            except Exception:
+                created = None
+        else:
+            created = None
+        if created and created >= today_start:
+            today_set += 1
+
+        if d.get("status") == "sold" and d.get("closed_at"):
+            try:
+                closed = datetime.fromisoformat(d["closed_at"])
+            except Exception:
+                closed = None
+            if closed and closed >= today_start:
+                today_sold += 1
+                if d.get("kw_size"):
+                    total_kw += d["kw_size"]
+
+    embed = discord.Embed(
+        title="📅 Today's Performance",
+        color=discord.Color.green(),
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(name="📞 Appointments Set", value=str(today_set), inline=True)
+    embed.add_field(name="✅ Deals Sold", value=str(today_sold), inline=True)
+    embed.add_field(name="⚡ Total kW", value=f"{total_kw:.1f}", inline=True)
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="pendingdeals", help="Show all pending (set but not sold/canceled)")
+async def pendingdeals(ctx: commands.Context):
+    pending = [
+        d for d in deals_data["deals"].values()
+        if d.get("status") == "set"
+    ]
     if not pending:
-        await ctx.send('✅ No pending appointments!')
+        await ctx.send("✅ No pending deals – everything is either sold or canceled.")
         return
 
     embed = discord.Embed(
-        title='🔔 Pending Appointments',
-        description=f'{len(pending)} appointment(s) waiting to be closed',
+        title="🔔 Pending Deals",
+        description=f"{len(pending)} deal(s) set and not sold yet",
         color=discord.Color.orange(),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC),
     )
 
-    for deal in pending[:10]:  # Show max 10
-        created = datetime.fromisoformat(deal['created_at']).strftime('%m/%d %H:%M')
-        assigned = deal.get('assigned_closer_name') or 'Unassigned'
+    for d in pending[:10]:
+        created = d.get("created_at")
+        created_str = ""
+        if created:
+            try:
+                created_str = datetime.fromisoformat(created).strftime("%m/%d %H:%M")
+            except Exception:
+                created_str = created
         embed.add_field(
-            name=f"{deal['customer_name']}",
-            value=f"Setter: {deal['setter_name']}\nAssigned Closer: {assigned}\nCreated: {created}",
-            inline=True
+            name=d.get("customer_name", "Unknown"),
+            value=f"Setter: {d.get('setter_name', 'Unknown')}\nCreated: {created_str}",
+            inline=True,
         )
 
     if len(pending) > 10:
-        embed.set_footer(text=f'Showing 10 of {len(pending)} pending deals')
+        embed.set_footer(text=f"Showing first 10 of {len(pending)} pending deals")
 
     await ctx.send(embed=embed)
 
 
-@bot.command(name='todaystats', help='Show today\'s performance')
-async def today_stats(ctx):
-    """Show statistics for today"""
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+# -----------------------------
+# Pinned commands helper
+# -----------------------------
 
-    # Count today's deals
-    today_closed = [
-        d for d in deals_data['deals'].values()
-        if d['status'] == 'closed' and
-        datetime.fromisoformat(d['closed_at']) >= today_start
-    ]
 
-    today_set = [
-        d for d in deals_data['deals'].values()
-        if datetime.fromisoformat(d['created_at']) >= today_start
-    ]
-
-    total_kw = sum(d['kw_size'] for d in today_closed if d['kw_size'])
-    total_revenue = sum(d['revenue'] for d in today_closed if d['revenue'])
-
+@bot.command(name="pin_commands", help="Admin/Manager – pin command cheat sheet in this channel")
+@commands.has_any_role("Admin", "Manager")
+async def pin_commands(ctx: commands.Context):
     embed = discord.Embed(
-        title='📅 Today\'s Performance',
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
+        title="📌 Solar Tracker – How to Use Commands",
+        description=(
+            "**IMPORTANT:**\n"
+            "👉 Run these commands in a **general or sales channel**, not in this leaderboard channel.\n\n"
+            "**Rep Commands**\n"
+            "• `#set First Last` – Log a new appointment\n"
+            "• `#sold First Last 8.5` – Mark deal as sold\n\n"
+            "**Manager / Admin**\n"
+            "• `#canceled First Last` – Cancel a deal\n\n"
+            "**Stats & Leaderboards**\n"
+            "• `!leaderboard [timeframe]` – Team leaderboard (all/today/week/month)\n"
+            "• `!mystats` – Your personal stats\n"
+            "• `!todaystats` – Today's performance\n"
+            "• `!managerboard [timeframe]` – Manager view (revenue + pay)\n\n"
+            "⚠️ This channel is read-only for leaderboard updates."
+        ),
+        color=0x00B894,
     )
 
-    embed.add_field(name='📞 Appointments Set', value=str(len(today_set)), inline=True)
-    embed.add_field(name='✅ Deals Closed', value=str(len(today_closed)), inline=True)
-    embed.add_field(name='⚡ Total kW', value=f'{total_kw:.1f}', inline=True)
-    embed.add_field(name='💰 Est. Revenue', value=f'${total_revenue:,.2f}', inline=True)
+    msg = await ctx.send(embed=embed)
 
-    await ctx.send(embed=embed)
+    # Unpin older bot pins to avoid clutter
+    pins = await ctx.channel.pins()
+    for p in pins:
+        if p.author == bot.user:
+            await p.unpin()
+
+    await msg.pin()
+    # Clean up the command message to keep channel spotless
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
+
+
+# -----------------------------
+# Daily summary task (lightweight)
+# -----------------------------
 
 
 @tasks.loop(hours=24)
-async def daily_stats_reset():
-    """Daily stats notification (optional - currently not used)"""
-    pass
+async def daily_summary_task():
+    # This could be expanded later; for now it's a no-op to avoid extra noise.
+    # Keeping the task so we can easily add daily recap broadcasts if you want.
+    return
 
 
-@bot.command(name='help_solar', help='Show all solar tracking commands')
-async def help_solar(ctx):
-    """Show help for solar tracking commands"""
+# -----------------------------
+# Help command override (solar-specific)
+# -----------------------------
+
+
+@bot.command(name="help_solar", help="Show solar tracking command guide")
+async def help_solar(ctx: commands.Context):
     embed = discord.Embed(
-        title='☀️ Solar Deal Tracker - Command Guide',
-        description='Track appointments and closed deals with ease!',
-        color=discord.Color.blue()
+        title="☀️ Solar Deal Tracker – Command Guide",
+        description="Track appointments, sold deals, and leaderboards.",
+        color=discord.Color.blue(),
     )
-
     embed.add_field(
-        name='📝 Hashtag Workflows',
-        value='`#appointmentset First Last [@CloserOptional]` - Log a new appointment (uses customer name)\n'
-              '`#closeddeal First Last {kw}` - Close a deal\n'
-              'Example: `#appointmentset John Smith @Mike`\n'
-              'Example: `#closeddeal John Smith 8.5`',
-        inline=False
+        name="📝 Hashtags",
+        value=(
+            "`#set First Last` – Appointment set for customer\n"
+            "`#sold First Last 8.5` – Deal sold with kW\n"
+            "`#canceled First Last` – Cancel deal (Admin/Manager only)"
+        ),
+        inline=False,
     )
-
     embed.add_field(
-        name='📊 Leaderboard Commands',
-        value='`!leaderboard [timeframe]` - View rankings (all/today/week/month)\n'
-              '`!mystats` - View your personal stats\n'
-              '`!todaystats` - Today\'s company performance',
-        inline=False
+        name="📊 Leaderboards & Stats",
+        value=(
+            "`!leaderboard [timeframe]` – Team leaderboard (all/today/week/month)\n"
+            "`!mystats` – Your stats\n"
+            "`!todaystats` – Today's performance\n"
+            "`!pendingdeals` – Deals set but not sold\n"
+            "`!managerboard [timeframe]` – Manager view (revenue + pay)"
+        ),
+        inline=False,
     )
-
     embed.add_field(
-        name='🔍 Deal Tracking',
-        value='`!dealinfo First Last` - View deal details by customer name\n'
-              '`!pendingdeals` - See all pending appointments',
-        inline=False
+        name="⚙️ Config (Owners)",
+        value=(
+            "`!configure_revenue` – DM wizard for revenue & pay\n"
+            "`!pin_commands` – Pin the commands cheat sheet in a leaderboard channel"
+        ),
+        inline=False,
     )
-
-    embed.add_field(
-        name='🛠 Admin Tools',
-        value='`!deletedeal First Last` - Hard delete a deal from the system\n'
-              '`!canceldeal First Last` - Mark a closed deal as canceled and roll back stats',
-        inline=False
-    )
-
-    embed.set_footer(text='Built for solar sales teams 🌞')
-
+    embed.set_footer(text="Built for solar sales teams 🌞")
     await ctx.send(embed=embed)
 
 
-# ---------- ADMIN COMMANDS ----------
+# -----------------------------
+# Admin: delete deal (optional)
+# -----------------------------
 
-@bot.command(name='deletedeal', help='Delete a deal by customer name (admin only)')
+
+@bot.command(name="deletedeal", help="Admin only – hard delete a deal by customer name")
 @commands.has_permissions(administrator=True)
-async def delete_deal(ctx, *, customer_name: str):
-    """Delete a deal from the system by customer name"""
-    customer_key = normalize_customer_name(customer_name)
-    if customer_key not in deals_data['deals']:
-        await ctx.send(f'❌ Deal for **{customer_key}** not found!')
+async def deletedeal(ctx: commands.Context, *, customer_name: str):
+    key = normalize_customer_name(customer_name)
+    deal = deals_data["deals"].get(key)
+    if not deal:
+        await ctx.send(f"❌ No deal found for **{customer_name}**.")
         return
 
-    deal = deals_data['deals'][customer_key]
+    # light rollback similar to #canceled
+    prev_status = deal["status"]
+    kw = deal.get("kw_size") or 0
+    rev = deal.get("revenue") or 0
 
-    # Remove from leaderboard stats
-    if deal['status'] == 'closed':
-        # Update closer stats
-        if deal['closer_id'] in leaderboard_data['closers']:
-            closer_data = leaderboard_data['closers'][deal['closer_id']]
-            closer_data['deals_closed'] -= 1
-            closer_data['total_kw'] -= deal['kw_size']
-            closer_data['total_revenue'] -= deal['revenue']
-            if customer_key in closer_data['deals']:
-                closer_data['deals'].remove(customer_key)
+    if prev_status == "set":
+        if deal["setter_id"] and deal["setter_id"] in leaderboard_data["setters"]:
+            leaderboard_data["setters"][deal["setter_id"]]["appointments_set"] -= 1
+    elif prev_status == "sold":
+        if deal["closer_id"] and deal["closer_id"] in leaderboard_data["closers"]:
+            cstats = leaderboard_data["closers"][deal["closer_id"]]
+            cstats["deals_closed"] -= 1
+            cstats["total_kw"] -= kw
+            cstats["total_revenue"] -= rev
+            if key in cstats["deals"]:
+                cstats["deals"].remove(key)
+        if deal["setter_id"] and deal["setter_id"] in leaderboard_data["setters"]:
+            sstats = leaderboard_data["setters"][deal["setter_id"]]
+            sstats["appointments_closed"] -= 1
+            sstats["total_kw"] -= kw
+            if key in sstats["deals"]:
+                sstats["deals"].remove(key)
 
-        # Update setter stats
-        if deal['setter_id'] in leaderboard_data['setters']:
-            setter_data = leaderboard_data['setters'][deal['setter_id']]
-            setter_data['appointments_closed'] -= 1
-            setter_data['total_kw'] -= deal['kw_size']
-            if customer_key in setter_data['deals']:
-                setter_data['deals'].remove(customer_key)
-    else:
-        # Just an appointment
-        if deal['setter_id'] in leaderboard_data['setters']:
-            leaderboard_data['setters'][deal['setter_id']]['appointments_set'] -= 1
+    del deals_data["deals"][key]
+    save_deals()
+    save_leaderboard()
 
-    # Delete the deal
-    del deals_data['deals'][customer_key]
-
-    save_deals(deals_data)
-    save_leaderboard(leaderboard_data)
-
-    await ctx.send(f'✅ Deal for **{customer_key}** has been deleted and stats updated.')
-
-
-@bot.command(name='canceldeal', help='Mark a closed deal as canceled (admin only)')
-@commands.has_permissions(administrator=True)
-async def cancel_deal(ctx, *, customer_name: str):
-    """Mark a closed deal as canceled and roll back stats, but keep the record."""
-    customer_key = normalize_customer_name(customer_name)
-    if customer_key not in deals_data['deals']:
-        await ctx.send(f'❌ Deal for **{customer_key}** not found!')
-        return
-
-    deal = deals_data['deals'][customer_key]
-
-    if deal['status'] != 'closed':
-        await ctx.send(
-            f'❌ Deal for **{customer_key}** is not closed (current status: {deal["status"]}). '
-            'Only closed deals can be canceled.'
-        )
-        return
-
-    kw_size = deal['kw_size'] or 0
-    revenue = deal['revenue'] or 0
-
-    # Roll back closer stats
-    if deal['closer_id'] in leaderboard_data['closers']:
-        closer_data = leaderboard_data['closers'][deal['closer_id']]
-        closer_data['deals_closed'] -= 1
-        closer_data['total_kw'] -= kw_size
-        closer_data['total_revenue'] -= revenue
-        if customer_key in closer_data['deals']:
-            closer_data['deals'].remove(customer_key)
-
-    # Roll back setter stats
-    if deal['setter_id'] in leaderboard_data['setters']:
-        setter_data = leaderboard_data['setters'][deal['setter_id']]
-        setter_data['appointments_closed'] -= 1
-        setter_data['total_kw'] -= kw_size
-        if customer_key in setter_data['deals']:
-            setter_data['deals'].remove(customer_key)
-
-    # Update deal status to canceled
-    deal['status'] = 'canceled'
-    deal['canceled_at'] = datetime.now().isoformat()
-
-    save_deals(deals_data)
-    save_leaderboard(leaderboard_data)
-
-    # DM setter + closer to notify cancel
-    guild = ctx.guild
-    guild_name = guild.name if guild else "your server"
-
-    setter_member = guild.get_member(int(deal['setter_id'])) if guild else None
-    closer_member = guild.get_member(int(deal['closer_id'])) if guild and deal.get('closer_id') else None
-
-    cancel_msg = (
-        f"❌ Deal for **{customer_key}** in **{guild_name}** has been marked as **canceled** by an admin.\n"
-        f"System Size (original): {kw_size} kW\n"
-        f"Est. Revenue (original): ${revenue:,.2f}"
+    await ctx.send(f"✅ Deal for **{customer_name}** has been deleted and stats updated.")
+    await send_audit(
+        ctx.guild,
+        f"🗑️ deletedeal – {customer_name} removed by {get_display_name(ctx.author)}"
     )
 
-    await safe_dm(setter_member, cancel_msg)
-    await safe_dm(closer_member, cancel_msg)
 
-    await ctx.send(f'✅ Deal for **{customer_key}** has been marked as canceled and stats updated.')
-
-
+# -----------------------------
 # Run the bot
-if __name__ == '__main__':
-    TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+# -----------------------------
 
+if __name__ == "__main__":
+    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     if not TOKEN:
-        print('Error: DISCORD_BOT_TOKEN environment variable not set!')
-        print('Please set your bot token before running the bot.')
+        print("Error: DISCORD_BOT_TOKEN environment variable not set!")
     else:
         bot.run(TOKEN)
