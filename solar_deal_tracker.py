@@ -346,6 +346,35 @@ async def on_message(message: discord.Message):
 
     parsed = parse_sold_message(message.content)
     if parsed:
+        # Block #sold usage inside leaderboard channels (view-only UX)
+        if (
+            isinstance(message.channel, discord.TextChannel)
+            and message.channel.name in (
+                "daily-leaderboard",
+                "weekly-leaderboard",
+                "monthly-leaderboard",
+            )
+        ):
+            # Delete the message to keep scoreboards clean
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+
+            # Quietly DM the user where to post instead
+            try:
+                await message.author.send(
+                    "Heads up: log sales in your main sales/general channel "
+                    "with `#sold @Setter kW`. The leaderboard channels are "
+                    "read-only scoreboards. 🙌"
+                )
+            except discord.Forbidden:
+                # Can't DM them, just silently ignore
+                pass
+
+            # Don't treat this as a sale
+            return
+
         setter_str, kw = parsed
 
         # Try to resolve setter mention
