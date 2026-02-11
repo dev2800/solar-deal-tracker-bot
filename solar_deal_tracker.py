@@ -1,9 +1,26 @@
 import os
 import json
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
+
+# ------------------------
+# Timezone
+# ------------------------
+
+# All "today / week / month" logic is based on Central Time
+LOCAL_TZ = ZoneInfo("America/Chicago")
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
 
 # ------------------------
 # Paths / storage
@@ -21,14 +38,12 @@ def _load_deals():
     try:
         with open(DEALS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # Basic sanity
         if "next_id" not in data:
             data["next_id"] = 1
         if "deals" not in data:
             data["deals"] = []
         return data
     except Exception:
-        # If file is corrupted, don't crash the bot
         return {"next_id": 1, "deals": []}
 
 
@@ -59,13 +74,20 @@ LEADERBOARD_CHANNELS = {
     "monthly-leaderboard": "Monthly sales leaderboard (read-only)",
 }
 
-
 # ------------------------
 # Helpers
 # ------------------------
 
-def _now_utc():
-    return datetime.now(timezone.utc)
+
+def _deal_type(kw: float) -> str:
+    """Return 'battery_only' if kW is 0, otherwise 'solar_battery'."""
+    return "battery_only" if kw == 0.0 else "solar_battery"
+
+
+def _deal_type_label(dtype: str) -> str:
+    if dtype == "battery_only":
+        return "Battery Only 🔋"
+    return "Solar + Battery ☀️🔋"
 
 
 def _parse_date(date_str: str):
@@ -101,7 +123,8 @@ def _add_deal(
         "closer_name": closer_name,
         "customer_name": customer_name,
         "kw": float(kw),
-        "status": "closed",  # closed | canceled
+        "deal_type": _deal_type(float(kw)),
+        "status": "closed",
         "created_at": _now_utc().isoformat(),
     }
     DEALS_DATA["deals"].append(deal)
@@ -119,7 +142,6 @@ def _find_latest_deal_by_customer(guild_id: int, customer_name: str):
     ]
     if not candidates:
         return None
-    # Sort by created_at descending
     candidates.sort(
         key=lambda d: d.get("created_at") or "",
         reverse=True,
@@ -127,7 +149,12 @@ def _find_latest_deal_by_customer(guild_id: int, customer_name: str):
     return candidates[0]
 
 
-def _filter_deals_period(guild_id: int, start: datetime, end: datetime, include_canceled: bool = False):
+def _filter_deals_period(
+    guild_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    include_canceled: bool = False,
+):
     deals = _get_guild_deals(guild_id)
     result = []
     for d in deals:
@@ -143,18 +170,16 @@ def _filter_deals_period(guild_id: int, start: datetime, end: datetime, include_
             created = datetime.fromisoformat(created_raw)
         except Exception:
             continue
-        if start <= created < end:
+        if start_utc <= created < end_utc:
             result.append(d)
     return result
 
 
 def _aggregate_by_closer(deals: list[dict]):
     """Return list of {name, deals, kw} sorted by deals then kw desc."""
-    stats: dict[int, dict] = {}
+    stats: dict[int | None, dict] = {}
     for d in deals:
         cid = d.get("closer_id")
-        if cid is None:
-            continue
         if cid not in stats:
             stats[cid] = {
                 "name": d.get("closer_name", "Unknown"),
@@ -168,9 +193,220 @@ def _aggregate_by_closer(deals: list[dict]):
     return out
 
 
+def _aggregate_by_setter(deals: list[dict]):
+    """Return list of {name, deals, kw} sorted by deals then kw desc for setters."""
+    stats: dict[str, dict] = {}
+    for d in deals:
+        name = (d.get("setter_name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key not in stats:
+            stats[key] = {
+                "name": name,
+                "deals": 0,
+                "kw": 0.0,
+            }
+        stats[key]["deals"] += 1
+        stats[key]["kw"] += float(d.get("kw") or 0.0)
+    out = list(stats.values())
+    out.sort(key=lambda x: (x["deals"], x["kw"]), reverse=True)
+    return out
+
+
+def _count_by_type(deals: list[dict]):
+    """Count deals by type (solar_battery vs battery_only)."""
+    solar_battery = 0
+    battery_only = 0
+    for d in deals:
+        # Support old deals that don't have deal_type field
+        dtype = d.get("deal_type")
+        if dtype is None:
+            dtype = _deal_type(float(d.get("kw") or 0.0))
+        if dtype == "battery_only":
+            battery_only += 1
+        else:
+            solar_battery += 1
+    return solar_battery, battery_only
+
+
+def _period_bounds(kind: str, base_dt: datetime):
+    """
+    Given kind in {"day","week","month"} and a timezone-aware datetime,
+    treat it in LOCAL_TZ and return:
+      (start_utc, end_utc, start_local, end_local, pretty_kind)
+    where boundaries are midnight LOCAL_TZ.
+    """
+    kind = kind.lower()
+    base_local = base_dt.astimezone(LOCAL_TZ)
+    d = base_local.date()
+
+    if kind in ("day", "today"):
+        start_local = datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ)
+        end_local = start_local + timedelta(days=1)
+        pretty_kind = "Daily Leaderboard"
+    elif kind in ("week", "thisweek"):
+        monday = d - timedelta(days=d.weekday())
+        start_local = datetime(monday.year, monday.month, monday.day, tzinfo=LOCAL_TZ)
+        end_local = start_local + timedelta(days=7)
+        pretty_kind = "Weekly Leaderboard"
+    elif kind in ("month", "thismonth"):
+        start_local = datetime(d.year, d.month, 1, tzinfo=LOCAL_TZ)
+        if d.month == 12:
+            end_local = datetime(d.year + 1, 1, 1, tzinfo=LOCAL_TZ)
+        else:
+            end_local = datetime(d.year, d.month + 1, 1, tzinfo=LOCAL_TZ)
+        pretty_kind = "Monthly Leaderboard"
+    else:
+        start_local = datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ)
+        end_local = start_local + timedelta(days=1)
+        pretty_kind = "Leaderboard"
+
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+    return start_utc, end_utc, start_local, end_local, pretty_kind
+
+
+# ---------------------------------------------------------------
+# Build leaderboard content  (plain-text style matching screenshot)
+# ---------------------------------------------------------------
+
+def _build_leaderboard_content(
+    deals: list[dict],
+    period_label: str,
+    date_label: str,
+) -> str:
+    """
+    Build a plain-text leaderboard message that matches the
+    'Weekly Blitz Scoreboard' screenshot format.
+    """
+    # Header
+    lines = []
+    lines.append(f"**{period_label}** ⚡")
+
+    # Deal type breakdown
+    solar_count, battery_count = _count_by_type(deals)
+    type_parts = []
+    if solar_count > 0:
+        type_parts.append(f"Solar + Battery ☀️🔋")
+    if battery_count > 0:
+        type_parts.append(f"Battery Only 🔋")
+    if type_parts:
+        lines.append(" | ".join(type_parts))
+    else:
+        lines.append("Solar + Battery ☀️🔋")
+
+    lines.append("")
+
+    if not deals:
+        lines.append("_No deals yet — be the first to log a sale with `#sold`!_")
+        return "\n".join(lines)
+
+    # Closer section
+    by_closer = _aggregate_by_closer(deals)
+    lines.append("**Closer:**")
+    for row in by_closer:
+        lines.append(f"{row['name']} - {row['deals']}")
+    lines.append("")
+
+    # Setter section
+    by_setter = _aggregate_by_setter(deals)
+    if by_setter:
+        lines.append("**Setter:**")
+        for row in by_setter:
+            lines.append(f"{row['name']} - {row['deals']}")
+        lines.append("")
+
+    # Totals
+    total_deals = len(deals)
+    total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
+
+    lines.append(f"**Total Transactions Sold:** {total_deals}")
+    lines.append(f"**Total kW Sold:** {total_kw:.2f} kW")
+
+    # Battery breakdown if there are battery-only deals
+    if battery_count > 0:
+        lines.append(f"**Battery Only Deals:** {battery_count}")
+    if solar_count > 0 and battery_count > 0:
+        lines.append(f"**Solar + Battery Deals:** {solar_count}")
+
+    lines.append("")
+    lines.append(
+        f"_Commands: type `#sold @Setter kW` in your general chat. "
+        f"Use `!mystats` to see your own numbers._"
+    )
+
+    return "\n".join(lines)
+
+
+def _build_leaderboard_embed(
+    guild: discord.Guild,
+    deals: list[dict],
+    period_label: str,
+    date_label: str,
+):
+    """Build an embed-style leaderboard (used by !leaderboard command)."""
+    embed = discord.Embed(
+        title="🏆 Solar Sales Leaderboard",
+        description=f"{period_label} • {date_label}",
+        color=0xf1c40f,
+    )
+
+    if not deals:
+        embed.add_field(
+            name="No deals yet",
+            value="Be the first to log a sale today with `#sold` in your general chat!",
+            inline=False,
+        )
+        return embed
+
+    # Closers
+    by_closer = _aggregate_by_closer(deals)
+    closer_lines = []
+    medals = ["🥇", "🥈", "🥉"]
+    for idx, row in enumerate(by_closer[:10]):
+        icon = medals[idx] if idx < len(medals) else f"{idx+1}."
+        closer_lines.append(
+            f"{icon} **{row['name']}** – {row['deals']} deal(s), {row['kw']:.1f} kW"
+        )
+    embed.add_field(name="Top Closers", value="\n".join(closer_lines), inline=False)
+
+    # Setters
+    by_setter = _aggregate_by_setter(deals)
+    if by_setter:
+        setter_lines = []
+        for idx, row in enumerate(by_setter[:10]):
+            icon = medals[idx] if idx < len(medals) else f"{idx+1}."
+            setter_lines.append(
+                f"{icon} **{row['name']}** – {row['deals']} deal(s), {row['kw']:.1f} kW"
+            )
+        embed.add_field(name="Top Setters", value="\n".join(setter_lines), inline=False)
+
+    # Type breakdown
+    solar_count, battery_count = _count_by_type(deals)
+    total_deals = len(deals)
+    total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
+
+    totals_value = f"💼 **Deals:** {total_deals}\n⚡ **kW:** {total_kw:.1f}"
+    if solar_count > 0:
+        totals_value += f"\n☀️🔋 **Solar + Battery:** {solar_count}"
+    if battery_count > 0:
+        totals_value += f"\n🔋 **Battery Only:** {battery_count}"
+
+    embed.add_field(
+        name="Totals",
+        value=totals_value,
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Use !leaderboard [day|week|month] [YYYY-MM-DD] for history • Times are in Central Time"
+    )
+    return embed
+
+
 async def ensure_leaderboard_channels(guild: discord.Guild):
     """Create / fix the three read-only leaderboard channels."""
-    # We need manage_channels permission for this to succeed
     try:
         bot_member = guild.me
         if bot_member is None:
@@ -183,6 +419,10 @@ async def ensure_leaderboard_channels(guild: discord.Guild):
                 read_message_history=True,
                 send_messages=False,
                 add_reactions=False,
+                create_public_threads=False,
+                create_private_threads=False,
+                create_forum_threads=False,
+                send_messages_in_threads=False,
             ),
             bot_member: discord.PermissionOverwrite(
                 view_channel=True,
@@ -190,6 +430,7 @@ async def ensure_leaderboard_channels(guild: discord.Guild):
                 send_messages=True,
                 embed_links=True,
                 manage_messages=True,
+                send_messages_in_threads=True,
             ),
         }
 
@@ -204,94 +445,38 @@ async def ensure_leaderboard_channels(guild: discord.Guild):
             else:
                 await chan.edit(topic=topic, overwrites=overwrites)
     except discord.Forbidden:
-        # Bot doesn't have permission – just skip silently
         return
     except Exception as e:
         print(f"[ensure_leaderboard_channels] error in guild {guild.id}: {e}")
 
 
-def _period_bounds(kind: str, base_date: datetime):
-    """
-    Given kind in {"day","week","month"} and a datetime (UTC),
-    return (start_datetime, end_datetime) in UTC.
-    """
-    kind = kind.lower()
-    d = base_date.date()
-
-    if kind in ("day", "today"):
-        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-        end = start + timedelta(days=1)
-    elif kind in ("week", "thisweek"):
-        # ISO week: Monday=0
-        monday = d - timedelta(days=d.weekday())
-        start = datetime(monday.year, monday.month, monday.day, tzinfo=timezone.utc)
-        end = start + timedelta(days=7)
-    elif kind in ("month", "thismonth"):
-        start = datetime(d.year, d.month, 1, tzinfo=timezone.utc)
-        if d.month == 12:
-            end = datetime(d.year + 1, 1, 1, tzinfo=timezone.utc)
-        else:
-            end = datetime(d.year, d.month + 1, 1, tzinfo=timezone.utc)
-    else:
-        # default: treat as day
-        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-        end = start + timedelta(days=1)
-
-    return start, end
-
-
-def _build_leaderboard_embed(
-    guild: discord.Guild,
-    deals: list[dict],
-    period_label: str,
-    date_label: str,
-):
-    embed = discord.Embed(
-        title="🏆 Solar Sales Leaderboard",
-        description=f"{period_label} • {date_label}",
-        color=0xf1c40f,
-    )
-
-    if not deals:
-        embed.add_field(name="No deals yet", value="Be the first to log a sale today with `#sold`!", inline=False)
-        return embed
-
-    by_closer = _aggregate_by_closer(deals)
-    lines = []
-    medals = ["🥇", "🥈", "🥉"]
-    for idx, row in enumerate(by_closer[:10]):
-        icon = medals[idx] if idx < len(medals) else f"{idx+1}."
-        lines.append(
-            f"{icon} **{row['name']}** – {row['deals']} deal(s), {row['kw']:.1f} kW"
-        )
-
-    embed.add_field(name="Top Closers", value="\n".join(lines), inline=False)
-
-    total_deals = len(deals)
-    total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
-
-    embed.add_field(
-        name="Totals",
-        value=f"💼 **Deals:** {total_deals}\n⚡ **kW:** {total_kw:.1f}",
-        inline=False,
-    )
-
-    embed.set_footer(text="Use !leaderboard [day|week|month] [YYYY-MM-DD] for history")
-    return embed
-
-
 async def _post_today_leaderboards(guild: discord.Guild):
-    """Recalculate today/week/month and drop fresh messages in the three channels."""
-    now = _now_utc()
+    """Recalculate today/week/month and drop fresh messages in the three channels.
+
+    Uses the plain-text 'Blitz Scoreboard' format for the channel posts
+    (matching the screenshot style).
+    """
+    now_local = _now_local()
+
     # Day
-    start_day, end_day = _period_bounds("day", now)
-    deals_day = _filter_deals_period(guild.id, start_day, end_day)
+    start_day_utc, end_day_utc, start_day_local, _, _ = _period_bounds("day", now_local)
+    deals_day = _filter_deals_period(guild.id, start_day_utc, end_day_utc)
+
     # Week
-    start_week, end_week = _period_bounds("week", now)
-    deals_week = _filter_deals_period(guild.id, start_week, end_week)
+    start_week_utc, end_week_utc, start_week_local, end_week_local, _ = _period_bounds(
+        "week", now_local
+    )
+    deals_week = _filter_deals_period(guild.id, start_week_utc, end_week_utc)
+
     # Month
-    start_month, end_month = _period_bounds("month", now)
-    deals_month = _filter_deals_period(guild.id, start_month, end_month)
+    (
+        start_month_utc,
+        end_month_utc,
+        start_month_local,
+        _,
+        _,
+    ) = _period_bounds("month", now_local)
+    deals_month = _filter_deals_period(guild.id, start_month_utc, end_month_utc)
 
     channel_map = {}
     for name in LEADERBOARD_CHANNELS.keys():
@@ -299,46 +484,48 @@ async def _post_today_leaderboards(guild: discord.Guild):
         if chan:
             channel_map[name] = chan
 
-    # Daily
+    # Daily — plain text scoreboard
     if "daily-leaderboard" in channel_map:
-        emb = _build_leaderboard_embed(
-            guild,
+        content = _build_leaderboard_content(
             deals_day,
-            "Daily Leaderboard",
-            now.date().isoformat(),
+            "Daily Blitz Scoreboard",
+            start_day_local.date().isoformat(),
         )
-        await channel_map["daily-leaderboard"].send(embed=emb)
+        await channel_map["daily-leaderboard"].send(content)
 
-    # Weekly
+    # Weekly — plain text scoreboard
     if "weekly-leaderboard" in channel_map:
-        emb = _build_leaderboard_embed(
-            guild,
+        week_label = (
+            f"{start_week_local.date().isoformat()} → "
+            f"{(end_week_local - timedelta(days=1)).date().isoformat()}"
+        )
+        content = _build_leaderboard_content(
             deals_week,
-            "Weekly Leaderboard",
-            f"Week of {start_week.date().isoformat()}",
+            "Weekly Blitz Scoreboard",
+            week_label,
         )
-        await channel_map["weekly-leaderboard"].send(embed=emb)
+        await channel_map["weekly-leaderboard"].send(content)
 
-    # Monthly
+    # Monthly — plain text scoreboard
     if "monthly-leaderboard" in channel_map:
-        emb = _build_leaderboard_embed(
-            guild,
+        month_label = start_month_local.date().strftime("%Y-%m")
+        content = _build_leaderboard_content(
             deals_month,
-            "Monthly Leaderboard",
-            start_month.date().strftime("%Y-%m"),
+            "Monthly Blitz Scoreboard",
+            month_label,
         )
-        await channel_map["monthly-leaderboard"].send(embed=emb)
+        await channel_map["monthly-leaderboard"].send(content)
 
 
 # ------------------------
 # Events
 # ------------------------
 
+
 @bot.event
 async def on_ready():
     print(f"{bot.user} has connected to Discord!")
     print(f"Guilds: {[g.name for g in bot.guilds]}")
-    # Make sure each guild has its leaderboard channels wired up
     for guild in bot.guilds:
         await ensure_leaderboard_channels(guild)
 
@@ -354,8 +541,11 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Ignore commands typed in leaderboard channels – those should stay clean
-    if isinstance(message.channel, discord.TextChannel) and message.channel.name in LEADERBOARD_CHANNELS:
+    # Ignore hashtag logging commands in leaderboard channels
+    if (
+        isinstance(message.channel, discord.TextChannel)
+        and message.channel.name in LEADERBOARD_CHANNELS
+    ):
         await bot.process_commands(message)
         return
 
@@ -363,18 +553,15 @@ async def on_message(message: discord.Message):
     lower = content.lower()
 
     # ------------------------
-    # #sold @Setter Customer Name kW
+    # #sold @Setter kW          (no customer name, just setter + kW)
+    # #sold @Setter Customer kW (original format also still works)
     # ------------------------
     if lower.startswith("#sold"):
-        # Example: #sold @Setter John Smith 6.5
-        # or      #sold Devin John Smith 6.5
         try:
             parts = content.split()
-            if len(parts) < 4:
+            if len(parts) < 3:
                 raise ValueError
 
-            # parts[0] == "#sold"
-            # Try to detect setter as mention first
             setter_member = message.mentions[0] if message.mentions else None
             setter_name = None
             setter_id = None
@@ -382,8 +569,6 @@ async def on_message(message: discord.Message):
             customer_name = None
 
             if setter_member:
-                # Find index of the mention token
-                # (its raw text will look like <@123> or <@!123>)
                 mention_token = None
                 for p in parts:
                     if p.startswith("<@") and p.endswith(">"):
@@ -394,27 +579,21 @@ async def on_message(message: discord.Message):
                 idx = parts.index(mention_token)
                 if len(parts) - idx < 2:
                     raise ValueError
-                # Last token is kw
                 kw_token = parts[-1]
                 kw = float(kw_token)
                 customer_tokens = parts[idx + 1 : -1]
-                if not customer_tokens:
-                    raise ValueError
-                customer_name = " ".join(customer_tokens)
+                # Customer name is optional now
+                customer_name = " ".join(customer_tokens) if customer_tokens else None
                 setter_id = setter_member.id
                 setter_name = setter_member.display_name
             else:
-                # No mention – assume: #sold SetterName Customer Name 6.5
-                if len(parts) < 4:
-                    raise ValueError
+                # #sold SetterName kW  or  #sold SetterName Customer Name kW
                 kw_token = parts[-1]
                 kw = float(kw_token)
                 setter_name = parts[1]
                 setter_id = None
                 customer_tokens = parts[2:-1]
-                if not customer_tokens:
-                    raise ValueError
-                customer_name = " ".join(customer_tokens)
+                customer_name = " ".join(customer_tokens) if customer_tokens else None
 
             closer_member = message.author
             closer_name = closer_member.display_name
@@ -425,35 +604,41 @@ async def on_message(message: discord.Message):
                 setter_name=setter_name,
                 closer_id=closer_member.id,
                 closer_name=closer_name,
-                customer_name=customer_name,
+                customer_name=customer_name or "N/A",
                 kw=kw,
             )
 
+            # Determine deal type label
+            dtype = _deal_type(kw)
+            dtype_label = _deal_type_label(dtype)
+
+            # Confirmation embed — matches the "DEAL CLOSED!" screenshot style
             embed = discord.Embed(
-                title="🎉 Deal Sold!",
+                title="🎉 DEAL CLOSED!",
                 color=0x2ecc71,
+                description=f"Deal for **{setter_name or 'N/A'}** has been logged!",
             )
-            embed.add_field(name="Customer", value=deal["customer_name"], inline=True)
+            embed.add_field(name="💼 Closer", value=closer_name, inline=True)
             embed.add_field(name="Setter", value=setter_name or "N/A", inline=True)
-            embed.add_field(name="Closer", value=closer_name, inline=True)
-            embed.add_field(name="System Size", value=f"{deal['kw']:.1f} kW", inline=True)
+            embed.add_field(name="⚡ System Size", value=f"{deal['kw']:.1f} kW", inline=True)
+            embed.add_field(name="Type", value=dtype_label, inline=True)
+            if customer_name and customer_name != "N/A":
+                embed.add_field(name="Customer", value=deal["customer_name"], inline=True)
             embed.set_footer(text=f"Deal ID: {deal['id']} • Logged via #sold")
 
             await message.channel.send(embed=embed)
-
-            # Update leaderboard channels for this guild
             await _post_today_leaderboards(message.guild)
 
         except ValueError:
             await message.channel.send(
                 "❌ Invalid `#sold` format.\n"
-                "Use: `#sold @Setter Customer Name kW`\n"
-                "Example: `#sold @Devin John Smith 6.5`"
+                "Use: `#sold @Setter kW`\n"
+                "Example: `#sold @Devin 6.5`\n"
+                "For battery only: `#sold @Devin 0`"
             )
         except Exception as e:
             await message.channel.send(f"❌ Error processing sale: {e}")
 
-        # Do not treat this as a normal command message
         return
 
     # ------------------------
@@ -467,11 +652,15 @@ async def on_message(message: discord.Message):
             customer_name = parts[1].strip()
             deal = _find_latest_deal_by_customer(message.guild.id, customer_name)
             if not deal:
-                await message.channel.send(f"❌ No deal found for customer `{customer_name}`.")
+                await message.channel.send(
+                    f"❌ No deal found for customer `{customer_name}`."
+                )
                 return
 
             if deal.get("status") == "canceled":
-                await message.channel.send(f"ℹ️ Latest deal for `{customer_name}` is already marked as canceled.")
+                await message.channel.send(
+                    f"ℹ️ Latest deal for `{customer_name}` is already marked as canceled."
+                )
                 return
 
             deal["status"] = "canceled"
@@ -483,13 +672,22 @@ async def on_message(message: discord.Message):
                 color=0xe67e22,
                 description=f"Customer: **{deal['customer_name']}**",
             )
-            embed.add_field(name="Original Closer", value=deal.get("closer_name", "Unknown"), inline=True)
+            embed.add_field(
+                name="Original Closer",
+                value=deal.get("closer_name", "Unknown"),
+                inline=True,
+            )
             if deal.get("setter_name"):
-                embed.add_field(name="Setter", value=deal["setter_name"], inline=True)
-            embed.add_field(name="System Size", value=f"{deal['kw']:.1f} kW", inline=True)
+                embed.add_field(
+                    name="Setter", value=deal["setter_name"], inline=True
+                )
+            embed.add_field(
+                name="System Size",
+                value=f"{deal['kw']:.1f} kW",
+                inline=True,
+            )
             await message.channel.send(embed=embed)
 
-            # Refresh leaderboards (canceled deals are excluded)
             await _post_today_leaderboards(message.guild)
 
         except ValueError:
@@ -502,13 +700,15 @@ async def on_message(message: discord.Message):
     # #delete Customer Name  (admin/manager only)
     # ------------------------
     if lower.startswith("#delete"):
-        # Only let admins or Manager/Admin roles do this
         perms = message.author.guild_permissions
         has_power_role = any(
-            r.name.lower() in {"admin", "manager"} for r in getattr(message.author, "roles", [])
+            r.name.lower() in {"admin", "manager"}
+            for r in getattr(message.author, "roles", [])
         )
         if not (perms.administrator or has_power_role):
-            await message.channel.send("⛔ Only admins or managers can delete deals.")
+            await message.channel.send(
+                "⛔ Only admins or managers can delete deals."
+            )
             return
 
         try:
@@ -518,14 +718,19 @@ async def on_message(message: discord.Message):
             customer_name = parts[1].strip()
             deal = _find_latest_deal_by_customer(message.guild.id, customer_name)
             if not deal:
-                await message.channel.send(f"❌ No deal found for customer `{customer_name}`.")
+                await message.channel.send(
+                    f"❌ No deal found for customer `{customer_name}`."
+                )
                 return
 
-            # Hard delete from list
-            DEALS_DATA["deals"] = [d for d in DEALS_DATA["deals"] if d["id"] != deal["id"]]
+            DEALS_DATA["deals"] = [
+                d for d in DEALS_DATA["deals"] if d["id"] != deal["id"]
+            ]
             _save_deals(DEALS_DATA)
 
-            await message.channel.send(f"🗑️ Deleted latest deal for `{customer_name}` from stats.")
+            await message.channel.send(
+                f"🗑️ Deleted latest deal for `{customer_name}` from stats."
+            )
             await _post_today_leaderboards(message.guild)
 
         except ValueError:
@@ -540,15 +745,22 @@ async def on_message(message: discord.Message):
     if lower.startswith("#clearleaderboard"):
         perms = message.author.guild_permissions
         has_power_role = any(
-            r.name.lower() in {"admin", "manager"} for r in getattr(message.author, "roles", [])
+            r.name.lower() in {"admin", "manager"}
+            for r in getattr(message.author, "roles", [])
         )
         if not (perms.administrator or has_power_role):
-            await message.channel.send("⛔ Only admins or managers can clear the leaderboard.")
+            await message.channel.send(
+                "⛔ Only admins or managers can clear the leaderboard."
+            )
             return
 
-        DEALS_DATA["deals"] = [d for d in DEALS_DATA["deals"] if d.get("guild_id") != message.guild.id]
+        DEALS_DATA["deals"] = [
+            d for d in DEALS_DATA["deals"] if d.get("guild_id") != message.guild.id
+        ]
         _save_deals(DEALS_DATA)
-        await message.channel.send("🔥 All deals for this server have been cleared. Fresh start!")
+        await message.channel.send(
+            "🔥 All deals for this server have been cleared. Fresh start!"
+        )
         await _post_today_leaderboards(message.guild)
         return
 
@@ -560,49 +772,75 @@ async def on_message(message: discord.Message):
 # Commands
 # ------------------------
 
+
 @bot.command(name="leaderboard")
-async def leaderboard_cmd(ctx: commands.Context, period: str = "day", date_str: str | None = None):
+async def leaderboard_cmd(
+    ctx: commands.Context, period: str = "day", date_str: str | None = None
+):
     """
     !leaderboard [day|week|month] [YYYY-MM-DD]
-    If date is omitted, uses today in UTC.
+    If date is omitted, uses today in Central Time.
     """
     if not ctx.guild:
         await ctx.send("This command only works in a server.")
         return
 
     period = period.lower()
-    if period not in {"day", "week", "month", "today", "thisweek", "thismonth"}:
-        await ctx.send("❌ Invalid period. Use one of: `day`, `week`, `month`.")
+    if period not in {
+        "day",
+        "week",
+        "month",
+        "today",
+        "thisweek",
+        "thismonth",
+    }:
+        await ctx.send(
+            "❌ Invalid period. Use one of: `day`, `week`, `month`."
+        )
         return
 
     if date_str:
         base_date = _parse_date(date_str)
         if not base_date:
-            await ctx.send("❌ Invalid date. Use format `YYYY-MM-DD` (example: `2026-02-06`).")
+            await ctx.send(
+                "❌ Invalid date. Use format `YYYY-MM-DD` (example: `2026-02-06`)."
+            )
             return
-        base_dt = datetime(base_date.year, base_date.month, base_date.day, tzinfo=timezone.utc)
+        base_dt_local = datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            tzinfo=LOCAL_TZ,
+        )
     else:
-        base_dt = _now_utc()
+        base_dt_local = _now_local()
 
-    start, end = _period_bounds(period, base_dt)
-    deals = _filter_deals_period(ctx.guild.id, start, end)
+    (
+        start_utc,
+        end_utc,
+        start_local,
+        end_local,
+        pretty_period,
+    ) = _period_bounds(period, base_dt_local)
 
-    date_label = f"{start.date().isoformat()} → {(end - timedelta(days=1)).date().isoformat()}"
+    deals = _filter_deals_period(ctx.guild.id, start_utc, end_utc)
+
     if period in {"day", "today"}:
-        date_label = start.date().isoformat()
+        date_label = start_local.date().isoformat()
     elif period in {"month", "thismonth"}:
-        date_label = start.date().strftime("%Y-%m")
+        date_label = start_local.date().strftime("%Y-%m")
+    else:
+        date_label = (
+            f"{start_local.date().isoformat()} → "
+            f"{(end_local - timedelta(days=1)).date().isoformat()}"
+        )
 
-    pretty_period = {
-        "day": "Daily Leaderboard",
-        "today": "Daily Leaderboard",
-        "week": "Weekly Leaderboard",
-        "thisweek": "Weekly Leaderboard",
-        "month": "Monthly Leaderboard",
-        "thismonth": "Monthly Leaderboard",
-    }.get(period, "Leaderboard")
-
-    embed = _build_leaderboard_embed(ctx.guild, deals, pretty_period, date_label)
+    embed = _build_leaderboard_embed(
+        ctx.guild,
+        deals,
+        pretty_period,
+        date_label,
+    )
     await ctx.send(embed=embed)
 
 
@@ -622,6 +860,7 @@ async def mystats_cmd(ctx: commands.Context):
 
     total_deals = len(deals)
     total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
+    solar_count, battery_count = _count_by_type(deals)
 
     embed = discord.Embed(
         title=f"📊 Stats for {ctx.author.display_name}",
@@ -629,6 +868,10 @@ async def mystats_cmd(ctx: commands.Context):
     )
     embed.add_field(name="Deals Closed", value=str(total_deals), inline=True)
     embed.add_field(name="Total kW", value=f"{total_kw:.1f}", inline=True)
+    if solar_count > 0:
+        embed.add_field(name="☀️🔋 Solar + Battery", value=str(solar_count), inline=True)
+    if battery_count > 0:
+        embed.add_field(name="🔋 Battery Only", value=str(battery_count), inline=True)
     await ctx.send(embed=embed)
 
 
@@ -638,15 +881,29 @@ async def help_cmd(ctx: commands.Context):
     embed = discord.Embed(
         title="☀️ Solar Leaderboard Bot – Commands",
         color=0x95a5a6,
-        description="Log sales with hashtags, use `!` commands for reports.",
+        description=(
+            "Log sales with hashtags in your **general chat**, "
+            "use `!` commands for reports.\n"
+            "_All leaderboards use Central Time._"
+        ),
     )
 
     embed.add_field(
-        name="Log a Sale",
+        name="Log a Sale (Solar + Battery)",
         value=(
-            "`#sold @Setter Customer Name kW`\n"
-            "• Example: `#sold @Devin John Smith 6.5`\n"
-            "• Can also use: `#sold Devin John Smith 6.5` (no mention)."
+            "`#sold @Setter kW`\n"
+            "• Example: `#sold @Devin 6.5`\n"
+            "• With customer: `#sold @Devin John Smith 6.5`"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Log a Battery-Only Sale",
+        value=(
+            "`#sold @Setter 0`\n"
+            "• Use **0** for kW to mark as battery only\n"
+            "• Example: `#sold @Devin 0`"
         ),
         inline=False,
     )
@@ -699,7 +956,9 @@ async def help_cmd(ctx: commands.Context):
         inline=False,
     )
 
-    embed.set_footer(text="Daily/weekly/monthly leaderboard channels are read-only – use #sold in your normal chat.")
+    embed.set_footer(
+        text="Daily/weekly/monthly leaderboard channels are read-only – use #sold in your normal chat."
+    )
     await ctx.send(embed=embed)
 
 
