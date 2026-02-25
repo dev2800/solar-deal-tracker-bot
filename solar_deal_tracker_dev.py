@@ -275,6 +275,54 @@ def _filter_deals_period(guild_id, start_utc, end_utc, include_canceled=False):
     return result
 
 
+def _get_user_deals(guild_id: int, user_id: int, user_name: str):
+    """
+    Get deals where user is closer OR setter.
+    Matches by ID first, then falls back to name matching for setters logged by name only.
+    """
+    deals = []
+    user_name_lower = user_name.lower().strip()
+    
+    for d in _get_guild_deals(guild_id):
+        if d.get("status") in ("canceled", "deleted"):
+            continue
+        
+        # Check if user is the closer (by ID)
+        if d.get("closer_id") == user_id:
+            deals.append(d)
+            continue
+        
+        # Check if user is the setter (by ID)
+        if d.get("setter_id") == user_id:
+            deals.append(d)
+            continue
+        
+        # Fallback: check setter by name (for deals logged without @mention)
+        setter_name = d.get("setter_name", "")
+        if setter_name and setter_name.lower().strip() == user_name_lower:
+            deals.append(d)
+            continue
+    
+    return deals
+
+
+def _get_user_deals_period(guild_id: int, user_id: int, user_name: str, start_utc, end_utc):
+    """Get user's deals within a specific time period."""
+    all_deals = _get_user_deals(guild_id, user_id, user_name)
+    result = []
+    for d in all_deals:
+        created_raw = d.get("created_at")
+        if not created_raw:
+            continue
+        try:
+            created = datetime.fromisoformat(created_raw)
+        except Exception:
+            continue
+        if start_utc <= created < end_utc:
+            result.append(d)
+    return result
+
+
 def _aggregate_by_role(deals, role):
     stats: dict[str, dict] = {}
     for d in deals:
@@ -365,10 +413,10 @@ def _build_leaderboard_content(deals, period_label, guild_id):
     if solar:
         lines.append("Solar + Battery ☀️🔋")
         lines.append("")
-        lines.extend(_section_lines(solar, "closer", guild_id, show_kw=show_kw))
+        lines.extend(_section_lines(solar, "closer", guild_id, use_mention=False, show_kw=show_kw))
         lines.append("")
         if show_setters:
-            sl = _section_lines(solar, "setter", guild_id, show_kw=show_kw)
+            sl = _section_lines(solar, "setter", guild_id, use_mention=False, show_kw=show_kw)
             if sl:
                 lines.extend(sl)
                 lines.append("")
@@ -377,10 +425,10 @@ def _build_leaderboard_content(deals, period_label, guild_id):
     if battery and show_battery:
         lines.append("Battery Only 🔋")
         lines.append("")
-        lines.extend(_section_lines(battery, "closer", guild_id, show_kw=show_kw))
+        lines.extend(_section_lines(battery, "closer", guild_id, use_mention=False, show_kw=show_kw))
         lines.append("")
         if show_setters:
-            sl = _section_lines(battery, "setter", guild_id, show_kw=show_kw)
+            sl = _section_lines(battery, "setter", guild_id, use_mention=False, show_kw=show_kw)
             if sl:
                 lines.extend(sl)
                 lines.append("")
@@ -620,7 +668,14 @@ async def on_guild_join(guild):
 async def on_message(message):
     if message.author.bot:
         return
+    
+    # Allow commands in leaderboard channels but not # commands
     if isinstance(message.channel, discord.TextChannel) and message.channel.name in LEADERBOARD_CHANNELS:
+        await bot.process_commands(message)
+        return
+
+    # Need a guild for the rest
+    if not message.guild:
         await bot.process_commands(message)
         return
 
@@ -638,24 +693,36 @@ async def on_message(message):
         try:
             parts = content.split()
             if len(parts) < 3:
-                raise ValueError
+                raise ValueError("Not enough arguments")
 
             setter_member = message.mentions[0] if message.mentions else None
-            setter_name = setter_id = kw = customer_name = None
+            setter_name = None
+            setter_id = None
+            kw = None
+            customer_name = None
 
             if setter_member:
-                mention_token = next((p for p in parts if p.startswith("<@") and p.endswith(">")), None)
+                # Find the mention token
+                mention_token = None
+                for p in parts:
+                    if p.startswith("<@") and p.endswith(">"):
+                        mention_token = p
+                        break
+                
                 if not mention_token:
-                    raise ValueError
+                    raise ValueError("Could not find mention token")
+                
                 idx = parts.index(mention_token)
                 if len(parts) - idx < 2:
-                    raise ValueError
+                    raise ValueError("Missing kW after setter")
+                
                 kw = float(parts[-1])
                 tokens = parts[idx + 1 : -1]
                 customer_name = " ".join(tokens) if tokens else None
                 setter_id = setter_member.id
                 setter_name = setter_member.display_name
             else:
+                # No mention - setter name is plain text
                 kw = float(parts[-1])
                 setter_name = parts[1]
                 tokens = parts[2:-1]
@@ -663,11 +730,15 @@ async def on_message(message):
 
             deal = _add_deal(
                 guild_id=message.guild.id,
-                setter_id=setter_id, setter_name=setter_name,
-                closer_id=message.author.id, closer_name=message.author.display_name,
-                customer_name=customer_name or "N/A", kw=kw,
+                setter_id=setter_id,
+                setter_name=setter_name,
+                closer_id=message.author.id,
+                closer_name=message.author.display_name,
+                customer_name=customer_name or "N/A",
+                kw=kw,
             )
 
+            # Build confirmation embed WITH mentions (this is when deal is sold)
             embed = discord.Embed(
                 title="🎉 DEAL CLOSED!",
                 color=0x2ecc71,
@@ -692,11 +763,12 @@ async def on_message(message):
             await message.channel.send(embed=embed)
             await _post_today_leaderboards(message.guild)
 
-        except ValueError:
+        except ValueError as ve:
             await message.channel.send(
                 "❌ Use: `#sold @Setter kW`\nExample: `#sold @Devin 6.5`\nBattery only: `#sold @Devin 0`"
             )
         except Exception as e:
+            print(f"[#sold error] {e}")
             await message.channel.send(f"❌ Error: {e}")
         return
 
@@ -711,14 +783,14 @@ async def on_message(message):
         try:
             parts = content.split()
             if len(parts) < 4:
-                raise ValueError
+                raise ValueError("Not enough arguments")
             mentions = message.mentions
             if len(mentions) < 2:
                 raise ValueError("Need @Closer and @Setter")
 
             mention_tokens = [p for p in parts if p.startswith("<@") and p.endswith(">")]
             if len(mention_tokens) < 2:
-                raise ValueError
+                raise ValueError("Need two mentions")
 
             closer_member = mentions[0]
             setter_member = mentions[1]
@@ -730,9 +802,12 @@ async def on_message(message):
 
             deal = _add_deal(
                 guild_id=message.guild.id,
-                setter_id=setter_member.id, setter_name=setter_member.display_name,
-                closer_id=closer_member.id, closer_name=closer_member.display_name,
-                customer_name=customer_name or "N/A", kw=kw,
+                setter_id=setter_member.id,
+                setter_name=setter_member.display_name,
+                closer_id=closer_member.id,
+                closer_name=closer_member.display_name,
+                customer_name=customer_name or "N/A",
+                kw=kw,
             )
 
             embed = discord.Embed(
@@ -775,7 +850,7 @@ async def on_message(message):
         try:
             parts = content.split(maxsplit=1)
             if len(parts) < 2:
-                raise ValueError
+                raise ValueError("Missing customer name")
             cust = parts[1].strip()
             deal = _find_latest_deal_by_customer(message.guild.id, cust)
             if not deal:
@@ -820,7 +895,7 @@ async def on_message(message):
         try:
             parts = content.split(maxsplit=1)
             if len(parts) < 2:
-                raise ValueError
+                raise ValueError("Missing deal ID or customer name")
             target = parts[1].strip()
 
             deal = None
@@ -968,35 +1043,78 @@ async def leaderboard_cmd(ctx, period: str = "day", date_str: str | None = None)
     else:
         dl = f"{sl.date()} → {(el - timedelta(days=1)).date()}"
 
+    # Admin gets mentions when using !leaderboard command
     mention_people = _is_admin(ctx.author)
     embed = _build_leaderboard_embed(ctx.guild, deals, pretty, dl, mention_people=mention_people)
     await ctx.send(embed=embed)
 
 
 @bot.command(name="mystats")
-async def mystats_cmd(ctx):
+async def mystats_cmd(ctx, period: str = "alltime"):
     """
+    !mystats [day|week|month|alltime]
     Show stats where the user is either the closer OR the setter.
-    (So setters see their numbers too.)
+    Works for both closers and setters.
     """
     if not ctx.guild:
         return
-    deals = [
-        d
-        for d in _get_guild_deals(ctx.guild.id)
-        if (d.get("closer_id") == ctx.author.id or d.get("setter_id") == ctx.author.id)
-        and d.get("status") not in ("canceled", "deleted")
-    ]
+    
+    period = period.lower()
+    if period not in {"day", "today", "week", "thisweek", "month", "thismonth", "alltime", "all"}:
+        await ctx.send("❌ Use: `!mystats [day|week|month|alltime]`")
+        return
+    
+    user_id = ctx.author.id
+    user_name = ctx.author.display_name
+    
+    if period in ("alltime", "all"):
+        # All time stats
+        deals = _get_user_deals(ctx.guild.id, user_id, user_name)
+        period_label = "All Time"
+    else:
+        # Period-based stats
+        base = _now_local()
+        su, eu, sl, el, _ = _period_bounds(period, base)
+        deals = _get_user_deals_period(ctx.guild.id, user_id, user_name, su, eu)
+        
+        if period in ("day", "today"):
+            period_label = f"Today ({sl.date().isoformat()})"
+        elif period in ("week", "thisweek"):
+            period_label = f"This Week ({sl.date()} → {(el - timedelta(days=1)).date()})"
+        else:  # month
+            period_label = f"This Month ({sl.strftime('%Y-%m')})"
+    
     total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
     solar, battery = _split_by_type(deals)
-
-    embed = discord.Embed(title=f"📊 Stats for {ctx.author.display_name}", color=0x3498db)
-    embed.add_field(name="Deals (Closer + Setter)", value=str(len(deals)), inline=True)
+    
+    # Count deals where user was closer vs setter
+    closer_deals = [d for d in deals if d.get("closer_id") == user_id]
+    setter_deals = [d for d in deals if d.get("setter_id") == user_id or 
+                   (d.get("setter_name", "").lower().strip() == user_name.lower().strip() and d.get("closer_id") != user_id)]
+    
+    embed = discord.Embed(
+        title=f"📊 Stats for {ctx.author.display_name}",
+        description=f"**{period_label}**",
+        color=0x3498db
+    )
+    embed.add_field(name="Total Deals", value=str(len(deals)), inline=True)
     embed.add_field(name="Total kW", value=f"{total_kw:.1f}", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)  # Spacer
+    
+    if closer_deals:
+        closer_kw = sum(float(d.get("kw") or 0.0) for d in closer_deals)
+        embed.add_field(name="💼 As Closer", value=f"{len(closer_deals)} deals ({closer_kw:.1f} kW)", inline=True)
+    
+    if setter_deals:
+        setter_kw = sum(float(d.get("kw") or 0.0) for d in setter_deals)
+        embed.add_field(name="📋 As Setter", value=f"{len(setter_deals)} deals ({setter_kw:.1f} kW)", inline=True)
+    
     if solar:
-        embed.add_field(name="☀️🔋 Solar+Batt", value=str(len(solar)), inline=True)
+        embed.add_field(name="☀️🔋 Solar+Battery", value=str(len(solar)), inline=True)
     if battery:
         embed.add_field(name="🔋 Battery Only", value=str(len(battery)), inline=True)
+    
+    embed.set_footer(text="Usage: !mystats [day|week|month|alltime]")
     await ctx.send(embed=embed)
 
 
@@ -1025,7 +1143,7 @@ async def toggle_cmd(ctx, feature: str | None = None):
             current = _guild_setting(gid, key)
             status = "✅ ON" if current else "❌ OFF"
             lines.append(f"`{key}` — {status}")
-        lines.append("\nFlip a setting: `!toggle <name>`")
+        lines.append("\nFlip a setting: `!toggle <n>`")
         await ctx.send("\n".join(lines))
         return
 
@@ -1067,7 +1185,7 @@ async def help_cmd(ctx):
     # Everyone can see their stats
     embed.add_field(
         name="Your Stats",
-        value="`!mystats` — your deals as closer or setter",
+        value="`!mystats` — all-time stats\n`!mystats day` — today's stats\n`!mystats week` — this week\n`!mystats month` — this month",
         inline=False,
     )
 
