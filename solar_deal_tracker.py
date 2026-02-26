@@ -98,11 +98,15 @@ def _get_guild_deals(guild_id: int):
     return [d for d in DEALS_DATA["deals"] if d.get("guild_id") == guild_id]
 
 
-def _mention_or_name(user_id: int | None, display_name: str) -> str:
-    """Return a Discord mention string if we have an ID, else just the name."""
-    if user_id:
+def _display_name(user_id: int | None, stored_name: str, use_mention: bool = False) -> str:
+    """
+    Return display string for a user.
+    - use_mention=True AND user_id exists -> <@user_id> (clickable mention)
+    - Otherwise -> just the plain display name (no ping)
+    """
+    if use_mention and user_id:
         return f"<@{user_id}>"
-    return display_name or "Unknown"
+    return stored_name or "Unknown"
 
 
 def _add_deal(
@@ -169,6 +173,54 @@ def _filter_deals_period(
             continue
         if not include_canceled and status == "canceled":
             continue
+        created_raw = d.get("created_at")
+        if not created_raw:
+            continue
+        try:
+            created = datetime.fromisoformat(created_raw)
+        except Exception:
+            continue
+        if start_utc <= created < end_utc:
+            result.append(d)
+    return result
+
+
+def _get_user_deals(guild_id: int, user_id: int, user_name: str):
+    """
+    Get all deals where user is the closer OR the setter.
+    Matches by ID first, then falls back to name matching for setters logged without @mention.
+    """
+    deals = []
+    user_name_lower = user_name.lower().strip()
+    
+    for d in _get_guild_deals(guild_id):
+        if d.get("status") in ("canceled", "deleted"):
+            continue
+        
+        # Check if user is the closer (by ID)
+        if d.get("closer_id") == user_id:
+            deals.append(d)
+            continue
+        
+        # Check if user is the setter (by ID)
+        if d.get("setter_id") == user_id:
+            deals.append(d)
+            continue
+        
+        # Fallback: check setter by name (for deals logged without @mention)
+        setter_name = d.get("setter_name", "")
+        if setter_name and setter_name.lower().strip() == user_name_lower:
+            deals.append(d)
+            continue
+    
+    return deals
+
+
+def _get_user_deals_period(guild_id: int, user_id: int, user_name: str, start_utc, end_utc):
+    """Get user's deals within a specific time period."""
+    all_deals = _get_user_deals(guild_id, user_id, user_name)
+    result = []
+    for d in all_deals:
         created_raw = d.get("created_at")
         if not created_raw:
             continue
@@ -256,11 +308,15 @@ def _period_bounds(kind: str, base_dt: datetime):
 
 
 # ---------------------------------------------------------------
-# Build scoreboard  (plain-text, matching VITAL screenshot layout)
+# Build scoreboard  (plain-text for leaderboard channels - NO MENTIONS)
 # ---------------------------------------------------------------
 
-def _build_section_lines(deals: list[dict], role: str) -> list[str]:
-    """Build 'Closer:' or 'Setter:' lines for a list of deals."""
+def _build_section_lines(deals: list[dict], role: str, show_kw: bool = True) -> list[str]:
+    """
+    Build 'Closer:' or 'Setter:' lines for a list of deals.
+    NO @mentions - just plain names.
+    Shows kW next to each person.
+    """
     agg = _aggregate_by_role(deals, role)
     if not agg:
         return []
@@ -269,8 +325,12 @@ def _build_section_lines(deals: list[dict], role: str) -> list[str]:
     lines.append(label)
     lines.append("")
     for row in agg:
-        mention = _mention_or_name(row["id"], row["name"])
-        lines.append(f"  {mention} - {row['deals']}")
+        # Use plain name, NOT mention
+        name = row["name"]
+        if show_kw:
+            lines.append(f"  {name} - {row['deals']} ({row['kw']:.1f} kW)")
+        else:
+            lines.append(f"  {name} - {row['deals']}")
     return lines
 
 
@@ -280,8 +340,9 @@ def _build_leaderboard_content(
     date_label: str,
 ) -> str:
     """
-    Build a plain-text scoreboard matching the VITAL 'Blitz Scoreboard'
-    layout with separate Solar+Battery and Battery Only sections.
+    Build a plain-text scoreboard for leaderboard channels.
+    NO @mentions - just plain display names.
+    Shows kW next to each person.
     """
     solar_deals, battery_deals = _split_by_type(deals)
 
@@ -298,12 +359,12 @@ def _build_leaderboard_content(
         lines.append("Solar + Battery ☀️🔋")
         lines.append("")
 
-        closer_lines = _build_section_lines(solar_deals, "closer")
+        closer_lines = _build_section_lines(solar_deals, "closer", show_kw=True)
         if closer_lines:
             lines.extend(closer_lines)
             lines.append("")
 
-        setter_lines = _build_section_lines(solar_deals, "setter")
+        setter_lines = _build_section_lines(solar_deals, "setter", show_kw=True)
         if setter_lines:
             lines.extend(setter_lines)
             lines.append("")
@@ -313,12 +374,12 @@ def _build_leaderboard_content(
         lines.append("Battery Only 🔋")
         lines.append("")
 
-        closer_lines = _build_section_lines(battery_deals, "closer")
+        closer_lines = _build_section_lines(battery_deals, "closer", show_kw=True)
         if closer_lines:
             lines.extend(closer_lines)
             lines.append("")
 
-        setter_lines = _build_section_lines(battery_deals, "setter")
+        setter_lines = _build_section_lines(battery_deals, "setter", show_kw=True)
         if setter_lines:
             lines.extend(setter_lines)
             lines.append("")
@@ -343,8 +404,12 @@ def _build_leaderboard_embed(
     deals: list[dict],
     period_label: str,
     date_label: str,
+    use_mentions: bool = True,
 ):
-    """Embed version used by the !leaderboard command."""
+    """
+    Embed version used by the !leaderboard command.
+    use_mentions=True for admin command, False otherwise.
+    """
     embed = discord.Embed(
         title=f"🏆 {period_label}",
         description=date_label,
@@ -367,8 +432,8 @@ def _build_leaderboard_embed(
         out = []
         for idx, row in enumerate(agg[:10]):
             icon = medals[idx] if idx < len(medals) else f"{idx+1}."
-            mention = _mention_or_name(row["id"], row["name"])
-            out.append(f"{icon} {mention} – {row['deals']} deal(s), {row['kw']:.1f} kW")
+            display = _display_name(row["id"], row["name"], use_mention=use_mentions)
+            out.append(f"{icon} {display} – {row['deals']} deal(s), {row['kw']:.1f} kW")
         return "\n".join(out)
 
     if solar_deals:
@@ -447,7 +512,10 @@ async def ensure_leaderboard_channels(guild: discord.Guild):
 
 
 async def _post_today_leaderboards(guild: discord.Guild):
-    """Post fresh scoreboards to all three leaderboard channels."""
+    """
+    Post fresh scoreboards to all three leaderboard channels.
+    NO @mentions - just plain text with names and kW.
+    """
     now_local = _now_local()
 
     start_day_utc, end_day_utc, start_day_local, _, _ = _period_bounds("day", now_local)
@@ -534,6 +602,11 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # Need a guild for # commands
+    if not message.guild:
+        await bot.process_commands(message)
+        return
+
     content = message.content.strip()
     lower = content.lower()
 
@@ -593,15 +666,24 @@ async def on_message(message: discord.Message):
 
             dtype_label = _deal_type_label(deal["deal_type"])
 
+            # Deal confirmation DOES use @mentions
             embed = discord.Embed(
                 title="🎉 DEAL CLOSED!",
                 color=0x2ecc71,
                 description=(
-                    f"Deal for {_mention_or_name(setter_id, setter_name)} has been logged!"
+                    f"Deal for {_display_name(setter_id, setter_name, use_mention=True)} has been logged!"
                 ),
             )
-            embed.add_field(name="💼 Closer", value=_mention_or_name(closer_member.id, closer_name), inline=True)
-            embed.add_field(name="Setter", value=_mention_or_name(setter_id, setter_name), inline=True)
+            embed.add_field(
+                name="💼 Closer",
+                value=_display_name(closer_member.id, closer_name, use_mention=True),
+                inline=True,
+            )
+            embed.add_field(
+                name="Setter",
+                value=_display_name(setter_id, setter_name, use_mention=True),
+                inline=True,
+            )
             embed.add_field(name="⚡ System Size", value=f"{deal['kw']:.1f} kW", inline=True)
             embed.add_field(name="Type", value=dtype_label, inline=True)
             if customer_name and customer_name != "N/A":
@@ -670,16 +752,25 @@ async def on_message(message: discord.Message):
 
             dtype_label = _deal_type_label(deal["deal_type"])
 
+            # Deal confirmation DOES use @mentions
             embed = discord.Embed(
                 title="🎉 DEAL CLOSED! (logged by admin)",
                 color=0x2ecc71,
                 description=(
                     f"Deal logged by {message.author.display_name} "
-                    f"for {_mention_or_name(closer_member.id, closer_member.display_name)}"
+                    f"for {_display_name(closer_member.id, closer_member.display_name, use_mention=True)}"
                 ),
             )
-            embed.add_field(name="💼 Closer", value=_mention_or_name(closer_member.id, closer_member.display_name), inline=True)
-            embed.add_field(name="Setter", value=_mention_or_name(setter_member.id, setter_member.display_name), inline=True)
+            embed.add_field(
+                name="💼 Closer",
+                value=_display_name(closer_member.id, closer_member.display_name, use_mention=True),
+                inline=True,
+            )
+            embed.add_field(
+                name="Setter",
+                value=_display_name(setter_member.id, setter_member.display_name, use_mention=True),
+                inline=True,
+            )
             embed.add_field(name="⚡ System Size", value=f"{deal['kw']:.1f} kW", inline=True)
             embed.add_field(name="Type", value=dtype_label, inline=True)
             if customer_name and customer_name != "N/A":
@@ -728,9 +819,17 @@ async def on_message(message: discord.Message):
                 color=0xe67e22,
                 description=f"Customer: **{deal['customer_name']}**",
             )
-            embed.add_field(name="Closer", value=_mention_or_name(deal.get("closer_id"), deal.get("closer_name", "Unknown")), inline=True)
+            embed.add_field(
+                name="Closer",
+                value=_display_name(deal.get("closer_id"), deal.get("closer_name", "Unknown")),
+                inline=True,
+            )
             if deal.get("setter_name"):
-                embed.add_field(name="Setter", value=_mention_or_name(deal.get("setter_id"), deal["setter_name"]), inline=True)
+                embed.add_field(
+                    name="Setter",
+                    value=_display_name(deal.get("setter_id"), deal["setter_name"]),
+                    inline=True,
+                )
             embed.add_field(name="System Size", value=f"{deal['kw']:.1f} kW", inline=True)
             embed.set_footer(text=f"Deal #{deal['id']}")
             await message.channel.send(embed=embed)
@@ -890,9 +989,17 @@ async def deals_cmd(ctx: commands.Context, period: str = "day", date_str: str | 
 
 @bot.command(name="leaderboard")
 async def leaderboard_cmd(ctx: commands.Context, period: str = "day", date_str: str | None = None):
-    """!leaderboard [day|week|month] [YYYY-MM-DD]"""
+    """
+    !leaderboard [day|week|month] [YYYY-MM-DD]
+    Admin only - shows @mentions for everyone on the board.
+    """
     if not ctx.guild:
         await ctx.send("This command only works in a server.")
+        return
+
+    # Admin only
+    if not _is_admin_or_manager(ctx.author):
+        await ctx.send("⛔ Only admins or managers can use `!leaderboard`.")
         return
 
     period = period.lower()
@@ -919,36 +1026,79 @@ async def leaderboard_cmd(ctx: commands.Context, period: str = "day", date_str: 
     else:
         date_label = f"{start_local.date()} → {(end_local - timedelta(days=1)).date()}"
 
-    embed = _build_leaderboard_embed(ctx.guild, deals, pretty, date_label)
+    # Always use @mentions since only admins can use this command
+    embed = _build_leaderboard_embed(ctx.guild, deals, pretty, date_label, use_mentions=True)
     await ctx.send(embed=embed)
 
 
 @bot.command(name="mystats")
-async def mystats_cmd(ctx: commands.Context):
+async def mystats_cmd(ctx: commands.Context, period: str = "alltime"):
+    """
+    !mystats [day|week|month|alltime]
+    Shows stats where user is closer OR setter.
+    Works for both closers and setters!
+    """
     if not ctx.guild:
         await ctx.send("This command only works in a server.")
         return
 
+    period = period.lower()
+    if period not in {"day", "today", "week", "thisweek", "month", "thismonth", "alltime", "all"}:
+        await ctx.send("❌ Use: `!mystats [day|week|month|alltime]`")
+        return
+
     user_id = ctx.author.id
-    deals = [
-        d for d in _get_guild_deals(ctx.guild.id)
-        if d.get("closer_id") == user_id and d.get("status") not in ("canceled", "deleted")
-    ]
+    user_name = ctx.author.display_name
+
+    if period in ("alltime", "all"):
+        # All time stats
+        deals = _get_user_deals(ctx.guild.id, user_id, user_name)
+        period_label = "All Time"
+    else:
+        # Period-based stats
+        base_dt = _now_local()
+        start_utc, end_utc, start_local, end_local, _ = _period_bounds(period, base_dt)
+        deals = _get_user_deals_period(ctx.guild.id, user_id, user_name, start_utc, end_utc)
+
+        if period in ("day", "today"):
+            period_label = f"Today ({start_local.date().isoformat()})"
+        elif period in ("week", "thisweek"):
+            period_label = f"This Week ({start_local.date()} → {(end_local - timedelta(days=1)).date()})"
+        else:  # month
+            period_label = f"This Month ({start_local.strftime('%Y-%m')})"
 
     total_deals = len(deals)
     total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
     solar_deals, battery_deals = _split_by_type(deals)
 
+    # Count deals where user was closer vs setter
+    closer_deals = [d for d in deals if d.get("closer_id") == user_id]
+    setter_deals = [d for d in deals if d.get("setter_id") == user_id or
+                   (d.get("setter_name", "").lower().strip() == user_name.lower().strip() and d.get("closer_id") != user_id)]
+
     embed = discord.Embed(
         title=f"📊 Stats for {ctx.author.display_name}",
+        description=f"**{period_label}**",
         color=0x3498db,
     )
-    embed.add_field(name="Deals Closed", value=str(total_deals), inline=True)
+    embed.add_field(name="Total Deals", value=str(total_deals), inline=True)
     embed.add_field(name="Total kW", value=f"{total_kw:.1f}", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)  # Spacer
+
+    if closer_deals:
+        closer_kw = sum(float(d.get("kw") or 0.0) for d in closer_deals)
+        embed.add_field(name="💼 As Closer", value=f"{len(closer_deals)} deals ({closer_kw:.1f} kW)", inline=True)
+
+    if setter_deals:
+        setter_kw = sum(float(d.get("kw") or 0.0) for d in setter_deals)
+        embed.add_field(name="📋 As Setter", value=f"{len(setter_deals)} deals ({setter_kw:.1f} kW)", inline=True)
+
     if solar_deals:
         embed.add_field(name="☀️🔋 Solar+Battery", value=str(len(solar_deals)), inline=True)
     if battery_deals:
         embed.add_field(name="🔋 Battery Only", value=str(len(battery_deals)), inline=True)
+
+    embed.set_footer(text="Usage: !mystats [day|week|month|alltime]")
     await ctx.send(embed=embed)
 
 
@@ -1000,7 +1150,10 @@ async def help_cmd(ctx: commands.Context):
         value=(
             "`!deals [day|week|month|all]` — list deals with IDs\n"
             "`!leaderboard [day|week|month] [YYYY-MM-DD]`\n"
-            "`!mystats` — your personal stats"
+            "`!mystats` — your all-time stats\n"
+            "`!mystats day` — today's stats\n"
+            "`!mystats week` — this week's stats\n"
+            "`!mystats month` — this month's stats"
         ),
         inline=False,
     )
