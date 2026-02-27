@@ -1,7 +1,11 @@
 import os
 import json
+import csv
+import asyncio
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from typing import Dict, Any, List, Optional
 
 import discord
 from discord.ext import commands
@@ -21,6 +25,10 @@ def _now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
 
 
+def _utc_iso() -> str:
+    return _now_utc().isoformat()
+
+
 # ------------------------
 # Paths / storage
 # ------------------------
@@ -29,6 +37,24 @@ DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DEALS_FILE = os.path.join(DATA_DIR, "deals.json")
+CONFIG_FILE = os.path.join(DATA_DIR, "server_config.json")
+
+# Loss reasons for no-sale
+LOSS_REASONS = {
+    "1": "ghosted",
+    "2": "one_legger",
+    "3": "needs_thought",
+    "4": "disqualified",
+    "5": "other",
+}
+
+LOSS_REASON_LABELS = {
+    "ghosted": "Ghosted",
+    "one_legger": "One-legger",
+    "needs_thought": "Needs to think",
+    "disqualified": "Disqualified",
+    "other": "Other / Misc",
+}
 
 
 def _load_deals():
@@ -53,7 +79,35 @@ def _save_deals(data):
     os.replace(tmp, DEALS_FILE)
 
 
+def _load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {
+            "revenue_enabled": False,
+            "revenue_per_kw": 0.0,
+            "ghl_enabled": False,
+            "ghl_webhook": None,
+        }
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "revenue_enabled": False,
+            "revenue_per_kw": 0.0,
+            "ghl_enabled": False,
+            "ghl_webhook": None,
+        }
+
+
+def _save_config(data):
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
+
 DEALS_DATA = _load_deals()
+CONFIG_DATA = _load_config()
 
 # ------------------------
 # Discord bot setup
@@ -78,13 +132,13 @@ LEADERBOARD_CHANNELS = {
 
 
 def _deal_type(kw: float) -> str:
-    return "battery_only" if kw == 0.0 else "solar_battery"
+    return "battery_only" if kw == 0.0 else "standard"
 
 
 def _deal_type_label(dtype: str) -> str:
     if dtype == "battery_only":
         return "Battery Only 🔋"
-    return "Solar + Battery ☀️🔋"
+    return "Standard ⚡"
 
 
 def _parse_date(date_str: str):
@@ -109,14 +163,69 @@ def _display_name(user_id: int | None, stored_name: str, use_mention: bool = Fal
     return stored_name or "Unknown"
 
 
+def _compute_revenue(kw: Optional[float]) -> Optional[float]:
+    """Calculate revenue based on kW if enabled."""
+    if not kw:
+        return None
+    if not CONFIG_DATA.get("revenue_enabled"):
+        return None
+    per_kw = float(CONFIG_DATA.get("revenue_per_kw") or 0.0)
+    if per_kw <= 0:
+        return None
+    return kw * per_kw
+
+
+def _compute_closer_streak(guild_id: int, closer_id: int) -> int:
+    """Consecutive days (including today) this closer has at least one sold deal."""
+    dates = set()
+    for d in _get_guild_deals(guild_id):
+        if d.get("status") == "sold" and d.get("closer_id") == closer_id:
+            closed_at = d.get("closed_at") or d.get("created_at")
+            if not closed_at:
+                continue
+            try:
+                dt = datetime.fromisoformat(closed_at)
+            except Exception:
+                continue
+            dates.add(dt.date())
+
+    if not dates:
+        return 0
+
+    streak = 0
+    current_day = _now_utc().date()
+    while current_day in dates:
+        streak += 1
+        current_day = current_day - timedelta(days=1)
+    return streak
+
+
+async def _send_ghl_event(event: str, payload: Dict[str, Any]) -> None:
+    """Optional GHL webhook (uses stdlib only)."""
+    if not CONFIG_DATA.get("ghl_enabled") or not CONFIG_DATA.get("ghl_webhook"):
+        return
+    try:
+        body = json.dumps({"event": event, **payload}).encode("utf-8")
+        req = urllib.request.Request(
+            CONFIG_DATA["ghl_webhook"],
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"GHL webhook error: {e}")
+
+
 def _add_deal(
     guild_id: int,
     setter_id: int | None,
     setter_name: str | None,
-    closer_id: int,
-    closer_name: str,
+    closer_id: int | None,
+    closer_name: str | None,
     customer_name: str,
-    kw: float,
+    kw: float | None,
+    status: str = "sold",
 ):
     deal_id = DEALS_DATA.get("next_id", 1)
     DEALS_DATA["next_id"] = deal_id + 1
@@ -129,10 +238,15 @@ def _add_deal(
         "closer_id": closer_id,
         "closer_name": closer_name,
         "customer_name": customer_name,
-        "kw": float(kw),
-        "deal_type": _deal_type(float(kw)),
-        "status": "closed",
+        "kw": float(kw) if kw is not None else None,
+        "deal_type": _deal_type(float(kw)) if kw is not None else None,
+        "status": status,
+        "loss_reason": None,
+        "loss_reason_detail": None,
         "created_at": _now_utc().isoformat(),
+        "closed_at": _now_utc().isoformat() if status == "sold" else None,
+        "no_sale_at": None,
+        "canceled_at": None,
     }
     DEALS_DATA["deals"].append(deal)
     _save_deals(DEALS_DATA)
@@ -146,13 +260,13 @@ def _find_deal_by_id(guild_id: int, deal_id: int):
     return None
 
 
-def _find_latest_deal_by_customer(guild_id: int, customer_name: str):
+def _find_latest_deal_by_customer(guild_id: int, customer_name: str, preferred_statuses: Optional[List[str]] = None):
     customer_lower = customer_name.strip().lower()
-    candidates = [
-        d
-        for d in _get_guild_deals(guild_id)
-        if d.get("customer_name", "").strip().lower() == customer_lower
-    ]
+    candidates = []
+    for d in _get_guild_deals(guild_id):
+        if d.get("customer_name", "").strip().lower() == customer_lower:
+            if preferred_statuses is None or d.get("status") in preferred_statuses:
+                candidates.append(d)
     if not candidates:
         return None
     candidates.sort(key=lambda d: d.get("created_at") or "", reverse=True)
@@ -164,20 +278,24 @@ def _filter_deals_period(
     start_utc: datetime,
     end_utc: datetime,
     include_canceled: bool = False,
+    status_filter: Optional[List[str]] = None,
 ):
     deals = _get_guild_deals(guild_id)
     result = []
     for d in deals:
-        status = d.get("status", "closed")
+        status = d.get("status", "sold")
         if status == "deleted":
             continue
-        if not include_canceled and status == "canceled":
+        if not include_canceled and status in ("canceled", "canceled_after_sign"):
             continue
-        created_raw = d.get("created_at")
-        if not created_raw:
+        if status_filter and status not in status_filter:
+            continue
+        # Use closed_at for sold deals, created_at for others
+        ts = d.get("closed_at") or d.get("created_at")
+        if not ts:
             continue
         try:
-            created = datetime.fromisoformat(created_raw)
+            created = datetime.fromisoformat(ts)
         except Exception:
             continue
         if start_utc <= created < end_utc:
@@ -194,7 +312,7 @@ def _get_user_deals(guild_id: int, user_id: int, user_name: str):
     user_name_lower = user_name.lower().strip()
     
     for d in _get_guild_deals(guild_id):
-        if d.get("status") in ("canceled", "deleted"):
+        if d.get("status") in ("deleted",):
             continue
         
         # Check if user is the closer (by ID)
@@ -221,11 +339,11 @@ def _get_user_deals_period(guild_id: int, user_id: int, user_name: str, start_ut
     all_deals = _get_user_deals(guild_id, user_id, user_name)
     result = []
     for d in all_deals:
-        created_raw = d.get("created_at")
-        if not created_raw:
+        ts = d.get("closed_at") or d.get("created_at")
+        if not ts:
             continue
         try:
-            created = datetime.fromisoformat(created_raw)
+            created = datetime.fromisoformat(ts)
         except Exception:
             continue
         if start_utc <= created < end_utc:
@@ -241,6 +359,9 @@ def _aggregate_by_role(deals: list[dict], role: str):
     """
     stats: dict[str, dict] = {}
     for d in deals:
+        # Only count sold deals for aggregation
+        if d.get("status") != "sold":
+            continue
         uid = d.get(f"{role}_id")
         name = (d.get(f"{role}_name") or "").strip()
         if not name:
@@ -262,18 +383,21 @@ def _aggregate_by_role(deals: list[dict], role: str):
 
 
 def _split_by_type(deals: list[dict]):
-    """Split deals into solar_battery and battery_only lists."""
-    solar = []
+    """Split deals into standard and battery_only lists."""
+    standard = []
     battery = []
     for d in deals:
+        if d.get("status") != "sold":
+            continue
         dtype = d.get("deal_type")
         if dtype is None:
-            dtype = _deal_type(float(d.get("kw") or 0.0))
+            kw = d.get("kw")
+            dtype = _deal_type(float(kw)) if kw is not None else "standard"
         if dtype == "battery_only":
             battery.append(d)
         else:
-            solar.append(d)
-    return solar, battery
+            standard.append(d)
+    return standard, battery
 
 
 def _period_bounds(kind: str, base_dt: datetime):
@@ -344,27 +468,29 @@ def _build_leaderboard_content(
     NO @mentions - just plain display names.
     Shows kW next to each person.
     """
-    solar_deals, battery_deals = _split_by_type(deals)
+    # Filter to only sold deals
+    sold_deals = [d for d in deals if d.get("status") == "sold"]
+    standard_deals, battery_deals = _split_by_type(sold_deals)
 
     lines = []
     lines.append(f"{period_label} ⚡")
     lines.append("")
 
-    if not deals:
+    if not sold_deals:
         lines.append("_No deals yet — be the first to log a sale with `#sold`!_")
         return "\n".join(lines)
 
-    # --- Solar + Battery section ---
-    if solar_deals:
-        lines.append("Solar + Battery ☀️🔋")
+    # --- Standard section ---
+    if standard_deals:
+        lines.append("Standard ⚡")
         lines.append("")
 
-        closer_lines = _build_section_lines(solar_deals, "closer", show_kw=True)
+        closer_lines = _build_section_lines(standard_deals, "closer", show_kw=True)
         if closer_lines:
             lines.extend(closer_lines)
             lines.append("")
 
-        setter_lines = _build_section_lines(solar_deals, "setter", show_kw=True)
+        setter_lines = _build_section_lines(standard_deals, "setter", show_kw=True)
         if setter_lines:
             lines.extend(setter_lines)
             lines.append("")
@@ -385,11 +511,17 @@ def _build_leaderboard_content(
             lines.append("")
 
     # --- Totals ---
-    total_deals = len(deals)
-    total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
+    total_deals = len(sold_deals)
+    total_kw = sum(float(d.get("kw") or 0.0) for d in sold_deals)
 
     lines.append(f"**Total Transactions Sold:** {total_deals}")
     lines.append(f"**Total kW Sold:** {total_kw:.2f} kW")
+    
+    # Revenue if enabled
+    if CONFIG_DATA.get("revenue_enabled"):
+        total_rev = sum(_compute_revenue(float(d.get("kw") or 0.0)) or 0.0 for d in sold_deals)
+        lines.append(f"**Est. Revenue:** ${total_rev:,.2f}")
+    
     lines.append("")
     lines.append(
         f"_Commands: type `#sold @Setter kW` in your general chat. "
@@ -416,7 +548,10 @@ def _build_leaderboard_embed(
         color=0xf1c40f,
     )
 
-    if not deals:
+    # Filter to only sold deals
+    sold_deals = [d for d in deals if d.get("status") == "sold"]
+
+    if not sold_deals:
         embed.add_field(
             name="No deals yet",
             value="Be the first to log a sale with `#sold`!",
@@ -424,7 +559,7 @@ def _build_leaderboard_embed(
         )
         return embed
 
-    solar_deals, battery_deals = _split_by_type(deals)
+    standard_deals, battery_deals = _split_by_type(sold_deals)
     medals = ["🥇", "🥈", "🥉"]
 
     def _role_lines(deal_list, role):
@@ -433,16 +568,20 @@ def _build_leaderboard_embed(
         for idx, row in enumerate(agg[:10]):
             icon = medals[idx] if idx < len(medals) else f"{idx+1}."
             display = _display_name(row["id"], row["name"], use_mention=use_mentions)
-            out.append(f"{icon} {display} – {row['deals']} deal(s), {row['kw']:.1f} kW")
+            line = f"{icon} {display} – {row['deals']} deal(s), {row['kw']:.1f} kW"
+            if CONFIG_DATA.get("revenue_enabled"):
+                rev = _compute_revenue(row["kw"]) or 0
+                line += f", ${rev:,.0f}"
+            out.append(line)
         return "\n".join(out)
 
-    if solar_deals:
-        cl = _role_lines(solar_deals, "closer")
+    if standard_deals:
+        cl = _role_lines(standard_deals, "closer")
         if cl:
-            embed.add_field(name="☀️🔋 Solar+Battery — Closers", value=cl, inline=False)
-        sl = _role_lines(solar_deals, "setter")
+            embed.add_field(name="⚡ Standard — Closers", value=cl, inline=False)
+        sl = _role_lines(standard_deals, "setter")
         if sl:
-            embed.add_field(name="☀️🔋 Solar+Battery — Setters", value=sl, inline=False)
+            embed.add_field(name="⚡ Standard — Setters", value=sl, inline=False)
 
     if battery_deals:
         cl = _role_lines(battery_deals, "closer")
@@ -452,17 +591,20 @@ def _build_leaderboard_embed(
         if sl:
             embed.add_field(name="🔋 Battery Only — Setters", value=sl, inline=False)
 
-    total_deals = len(deals)
-    total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
-    embed.add_field(
-        name="Totals",
-        value=(
-            f"💼 **Deals:** {total_deals}\n"
-            f"⚡ **kW:** {total_kw:.1f}\n"
-            f"☀️🔋 Solar+Battery: {len(solar_deals)}  •  🔋 Battery Only: {len(battery_deals)}"
-        ),
-        inline=False,
+    total_deals = len(sold_deals)
+    total_kw = sum(float(d.get("kw") or 0.0) for d in sold_deals)
+    
+    totals_value = (
+        f"💼 **Deals:** {total_deals}\n"
+        f"⚡ **kW:** {total_kw:.1f}\n"
+        f"Standard: {len(standard_deals)}  •  Battery Only: {len(battery_deals)}"
     )
+    
+    if CONFIG_DATA.get("revenue_enabled"):
+        total_rev = sum(_compute_revenue(float(d.get("kw") or 0.0)) or 0.0 for d in sold_deals)
+        totals_value += f"\n💰 **Est. Revenue:** ${total_rev:,.2f}"
+    
+    embed.add_field(name="Totals", value=totals_value, inline=False)
     embed.set_footer(text="Use !leaderboard [day|week|month] [YYYY-MM-DD] for history")
     return embed
 
@@ -611,14 +753,54 @@ async def on_message(message: discord.Message):
     lower = content.lower()
 
     # ----------------------------------------------------------------
-    # #sold @Setter kW
-    # #sold @Setter Customer Name kW
+    # #set Customer Name - Log an appointment (setter)
+    # ----------------------------------------------------------------
+    if lower.startswith("#set "):
+        customer_name = content[5:].strip()
+        if not customer_name:
+            await message.channel.send("❌ Please include the customer's name. Example: `#set John Smith`")
+            await bot.process_commands(message)
+            return
+
+        deal = _add_deal(
+            guild_id=message.guild.id,
+            setter_id=message.author.id,
+            setter_name=message.author.display_name,
+            closer_id=None,
+            closer_name=None,
+            customer_name=customer_name,
+            kw=None,
+            status="set",
+        )
+
+        embed = discord.Embed(
+            title="🎯 Appointment Set!",
+            description=f"{message.author.mention} just set an appointment!",
+            color=discord.Color.green(),
+            timestamp=_now_utc(),
+        )
+        embed.add_field(name="Customer", value=customer_name, inline=True)
+        embed.add_field(name="Setter", value=message.author.display_name, inline=True)
+        embed.add_field(name="Status", value="🟡 Pending Close", inline=True)
+        embed.add_field(name="Deal ID", value=f"#{deal['id']}", inline=True)
+        embed.add_field(
+            name="How to close this later",
+            value="Use: `#sold Customer Name kW`\nExample: `#sold John Smith 8.5`",
+            inline=False,
+        )
+        embed.set_footer(text="Deal Tracker • Track your deals in real-time")
+
+        await message.channel.send(embed=embed)
+        return
+
+    # ----------------------------------------------------------------
+    # #sold @Setter kW  OR  #sold Customer Name kW
     # ----------------------------------------------------------------
     if lower.startswith("#sold") and not lower.startswith("#soldfor"):
         try:
             parts = content.split()
             if len(parts) < 3:
-                raise ValueError
+                raise ValueError("Not enough parts")
 
             setter_member = message.mentions[0] if message.mentions else None
             setter_name = None
@@ -627,16 +809,17 @@ async def on_message(message: discord.Message):
             customer_name = None
 
             if setter_member:
+                # Format: #sold @Setter [Customer Name] kW
                 mention_token = None
                 for p in parts:
                     if p.startswith("<@") and p.endswith(">"):
                         mention_token = p
                         break
                 if mention_token is None:
-                    raise ValueError
+                    raise ValueError("No mention found")
                 idx = parts.index(mention_token)
                 if len(parts) - idx < 2:
-                    raise ValueError
+                    raise ValueError("Missing kW")
                 kw_token = parts[-1]
                 kw = float(kw_token)
                 customer_tokens = parts[idx + 1 : -1]
@@ -644,12 +827,68 @@ async def on_message(message: discord.Message):
                 setter_id = setter_member.id
                 setter_name = setter_member.display_name
             else:
+                # Format: #sold Customer Name kW (check if there's a pending deal)
                 kw_token = parts[-1]
                 kw = float(kw_token)
-                setter_name = parts[1]
-                setter_id = None
-                customer_tokens = parts[2:-1]
-                customer_name = " ".join(customer_tokens) if customer_tokens else None
+                customer_name = " ".join(parts[1:-1]).strip()
+                
+                # Try to find existing deal for this customer
+                existing_deal = _find_latest_deal_by_customer(
+                    message.guild.id, 
+                    customer_name, 
+                    preferred_statuses=["set"]
+                )
+                
+                if existing_deal:
+                    # Update existing deal
+                    existing_deal["status"] = "sold"
+                    existing_deal["closer"] = message.author.display_name
+                    existing_deal["closer_id"] = message.author.id
+                    existing_deal["closer_name"] = message.author.display_name
+                    existing_deal["kw"] = kw
+                    existing_deal["deal_type"] = _deal_type(kw)
+                    existing_deal["closed_at"] = _now_utc().isoformat()
+                    _save_deals(DEALS_DATA)
+                    
+                    setter_id = existing_deal.get("setter_id")
+                    setter_name = existing_deal.get("setter_name")
+                    
+                    revenue = _compute_revenue(kw)
+                    streak_days = _compute_closer_streak(message.guild.id, message.author.id)
+                    
+                    # Send GHL event
+                    await _send_ghl_event("deal_sold", {
+                        "customer_name": customer_name,
+                        "kw": kw,
+                        "revenue": revenue,
+                        "setter": setter_name,
+                        "closer": message.author.display_name,
+                        "deal_id": existing_deal["id"],
+                    })
+                    
+                    embed = discord.Embed(
+                        title="🎉 DEAL CLOSED!",
+                        description=f"Deal for **{customer_name}** has been closed!",
+                        color=discord.Color.gold(),
+                        timestamp=_now_utc(),
+                    )
+                    embed.add_field(name="⚡ System Size", value=f"{kw:.1f} kW", inline=True)
+                    if revenue:
+                        embed.add_field(name="💰 Est. Revenue", value=f"${revenue:,.2f}", inline=True)
+                    embed.add_field(name="👤 Setter", value=setter_name or "N/A", inline=True)
+                    embed.add_field(name="🤝 Closer", value=message.author.display_name, inline=True)
+                    embed.add_field(name="Deal ID", value=f"#{existing_deal['id']}", inline=True)
+                    if streak_days > 0:
+                        embed.add_field(name="🔥 Streak", value=f"{streak_days} day(s)", inline=True)
+                    
+                    await message.channel.send(embed=embed)
+                    await _post_today_leaderboards(message.guild)
+                    return
+                else:
+                    # No existing deal - treat first word after #sold as setter name
+                    setter_name = parts[1]
+                    customer_tokens = parts[2:-1]
+                    customer_name = " ".join(customer_tokens) if customer_tokens else "N/A"
 
             closer_member = message.author
             closer_name = closer_member.display_name
@@ -662,9 +901,22 @@ async def on_message(message: discord.Message):
                 closer_name=closer_name,
                 customer_name=customer_name or "N/A",
                 kw=kw,
+                status="sold",
             )
 
+            revenue = _compute_revenue(kw)
+            streak_days = _compute_closer_streak(message.guild.id, closer_member.id)
             dtype_label = _deal_type_label(deal["deal_type"])
+
+            # Send GHL event
+            await _send_ghl_event("deal_sold", {
+                "customer_name": deal["customer_name"],
+                "kw": kw,
+                "revenue": revenue,
+                "setter": setter_name,
+                "closer": closer_name,
+                "deal_id": deal["id"],
+            })
 
             # Deal confirmation DOES use @mentions
             embed = discord.Embed(
@@ -686,8 +938,12 @@ async def on_message(message: discord.Message):
             )
             embed.add_field(name="⚡ System Size", value=f"{deal['kw']:.1f} kW", inline=True)
             embed.add_field(name="Type", value=dtype_label, inline=True)
+            if revenue:
+                embed.add_field(name="💰 Est. Revenue", value=f"${revenue:,.2f}", inline=True)
             if customer_name and customer_name != "N/A":
                 embed.add_field(name="Customer", value=deal["customer_name"], inline=True)
+            if streak_days > 0:
+                embed.add_field(name="🔥 Streak", value=f"{streak_days} day(s) in a row", inline=True)
             embed.set_footer(text=f"Deal #{deal['id']}")
 
             await message.channel.send(embed=embed)
@@ -696,17 +952,15 @@ async def on_message(message: discord.Message):
         except ValueError:
             await message.channel.send(
                 "❌ Invalid `#sold` format.\n"
-                "Use: `#sold @Setter kW`\n"
-                "Example: `#sold @Devin 6.5`\n"
-                "Battery only: `#sold @Devin 0`"
+                "Use: `#sold @Setter kW` or `#sold Customer Name kW`\n"
+                "Example: `#sold @Devin 6.5` or `#sold John Smith 6.5`"
             )
         except Exception as e:
             await message.channel.send(f"❌ Error processing sale: {e}")
         return
 
     # ----------------------------------------------------------------
-    # #soldfor @Closer @Setter kW   (admin only — log deal for someone else)
-    # #soldfor @Closer @Setter Customer Name kW
+    # #soldfor @Closer @Setter kW   (admin only)
     # ----------------------------------------------------------------
     if lower.startswith("#soldfor"):
         if not _is_admin_or_manager(message.author):
@@ -715,23 +969,20 @@ async def on_message(message: discord.Message):
 
         try:
             parts = content.split()
-            # Need at least: #soldfor @Closer @Setter kW
             if len(parts) < 4:
-                raise ValueError
+                raise ValueError("Not enough parts")
 
             mentions = message.mentions
             if len(mentions) < 2:
                 raise ValueError("Need two @mentions: closer and setter")
 
-            # Find the mention tokens in order
             mention_tokens = [p for p in parts if p.startswith("<@") and p.endswith(">")]
             if len(mention_tokens) < 2:
-                raise ValueError
+                raise ValueError("Need two mentions")
 
             closer_member = mentions[0]
             setter_member = mentions[1]
 
-            # Find position after second mention
             second_mention_idx = parts.index(mention_tokens[1])
 
             kw_token = parts[-1]
@@ -748,11 +999,12 @@ async def on_message(message: discord.Message):
                 closer_name=closer_member.display_name,
                 customer_name=customer_name or "N/A",
                 kw=kw,
+                status="sold",
             )
 
+            revenue = _compute_revenue(kw)
             dtype_label = _deal_type_label(deal["deal_type"])
 
-            # Deal confirmation DOES use @mentions
             embed = discord.Embed(
                 title="🎉 DEAL CLOSED! (logged by admin)",
                 color=0x2ecc71,
@@ -773,6 +1025,8 @@ async def on_message(message: discord.Message):
             )
             embed.add_field(name="⚡ System Size", value=f"{deal['kw']:.1f} kW", inline=True)
             embed.add_field(name="Type", value=dtype_label, inline=True)
+            if revenue:
+                embed.add_field(name="💰 Est. Revenue", value=f"${revenue:,.2f}", inline=True)
             if customer_name and customer_name != "N/A":
                 embed.add_field(name="Customer", value=deal["customer_name"], inline=True)
             embed.set_footer(text=f"Deal #{deal['id']}")
@@ -784,65 +1038,129 @@ async def on_message(message: discord.Message):
             await message.channel.send(
                 "❌ Invalid `#soldfor` format.\n"
                 "Use: `#soldfor @Closer @Setter kW`\n"
-                "Example: `#soldfor @Ethen @Devin 6.5`\n"
-                "With customer: `#soldfor @Ethen @Devin John Smith 6.5`\n"
-                "Battery only: `#soldfor @Ethen @Devin 0`"
+                "Example: `#soldfor @Ethen @Devin 6.5`"
             )
         except Exception as e:
             await message.channel.send(f"❌ Error processing sale: {e}")
         return
 
     # ----------------------------------------------------------------
-    # #cancel Customer Name
+    # #nosale Customer Name - Mark a deal as no-sale with reason tracking
     # ----------------------------------------------------------------
-    if lower.startswith("#cancel"):
+    if lower.startswith("#nosale "):
+        customer_name = content[8:].strip()
+        if not customer_name:
+            await message.channel.send("❌ Please include the customer's name. Example: `#nosale John Smith`")
+            await bot.process_commands(message)
+            return
+
+        deal = _find_latest_deal_by_customer(message.guild.id, customer_name, preferred_statuses=["set"])
+        if not deal:
+            await message.channel.send(
+                f"❌ No pending appointment found for **{customer_name}**. "
+                "Make sure it was logged with `#set` first."
+            )
+            await bot.process_commands(message)
+            return
+
+        deal["status"] = "no_sale"
+        deal["no_sale_at"] = _now_utc().isoformat()
+        deal["closer_id"] = message.author.id
+        deal["closer_name"] = message.author.display_name
+        _save_deals(DEALS_DATA)
+
+        # DM for loss reason
         try:
-            parts = content.split(maxsplit=1)
-            if len(parts) < 2:
-                raise ValueError
-            customer_name = parts[1].strip()
-            deal = _find_latest_deal_by_customer(message.guild.id, customer_name)
-            if not deal:
-                await message.channel.send(f"❌ No deal found for customer `{customer_name}`.")
-                return
+            prompt = (
+                f"Why did **{deal['customer_name']}** not close?\n"
+                "Reply with a number:\n"
+                "1️⃣ Ghosted\n"
+                "2️⃣ One-legger (only one decision maker)\n"
+                "3️⃣ Needs to think\n"
+                "4️⃣ Disqualified\n"
+                "5️⃣ Other"
+            )
+            await message.author.send(prompt)
 
-            if deal.get("status") == "canceled":
-                await message.channel.send(f"ℹ️ Latest deal for `{customer_name}` is already canceled.")
-                return
+            def check(m: discord.Message) -> bool:
+                return m.author == message.author and isinstance(m.channel, discord.DMChannel)
 
-            deal["status"] = "canceled"
-            deal["canceled_at"] = _now_utc().isoformat()
+            reply = await bot.wait_for("message", timeout=120, check=check)
+            key = reply.content.strip()
+            reason_code = LOSS_REASONS.get(key, "other")
+
+            if reason_code == "other":
+                await message.author.send("Please type a short reason:")
+                reply2 = await bot.wait_for("message", timeout=180, check=check)
+                reason_text = reply2.content.strip()
+            else:
+                reason_text = LOSS_REASON_LABELS.get(reason_code, reason_code.title())
+
+            deal["loss_reason"] = reason_code
+            deal["loss_reason_detail"] = reason_text
             _save_deals(DEALS_DATA)
 
-            embed = discord.Embed(
-                title="⚠️ Deal Canceled",
-                color=0xe67e22,
-                description=f"Customer: **{deal['customer_name']}**",
+            await message.channel.send(f"🚫 **{deal['customer_name']}** marked as no-sale ({reason_text}).")
+        except asyncio.TimeoutError:
+            await message.channel.send(
+                f"⏱️ No loss reason received for **{deal['customer_name']}**. Marked as no-sale."
             )
-            embed.add_field(
-                name="Closer",
-                value=_display_name(deal.get("closer_id"), deal.get("closer_name", "Unknown")),
-                inline=True,
+        except discord.Forbidden:
+            await message.channel.send(
+                f"🚫 **{deal['customer_name']}** marked as no-sale. "
+                "(Couldn't DM you for the loss reason - please enable DMs from server members.)"
             )
-            if deal.get("setter_name"):
-                embed.add_field(
-                    name="Setter",
-                    value=_display_name(deal.get("setter_id"), deal["setter_name"]),
-                    inline=True,
-                )
-            embed.add_field(name="System Size", value=f"{deal['kw']:.1f} kW", inline=True)
-            embed.set_footer(text=f"Deal #{deal['id']}")
-            await message.channel.send(embed=embed)
-            await _post_today_leaderboards(message.guild)
-
-        except ValueError:
-            await message.channel.send("❌ Use: `#cancel Customer Name`")
-        except Exception as e:
-            await message.channel.send(f"❌ Error: {e}")
         return
 
     # ----------------------------------------------------------------
-    # #delete <ID>  or  #delete Customer Name   (admin/manager only)
+    # #cancel Customer Name - Mark deal as canceled
+    # ----------------------------------------------------------------
+    if lower.startswith("#cancel "):
+        customer_name = content[8:].strip()
+        if not customer_name:
+            await message.channel.send("❌ Please include the customer's name. Example: `#cancel John Smith`")
+            await bot.process_commands(message)
+            return
+
+        deal = _find_latest_deal_by_customer(message.guild.id, customer_name)
+        if not deal:
+            await message.channel.send(f"❌ No deal found for customer `{customer_name}`.")
+            return
+
+        if deal.get("status") in ("canceled", "canceled_after_sign"):
+            await message.channel.send(f"ℹ️ Deal for `{customer_name}` is already canceled.")
+            return
+
+        old_status = deal.get("status")
+        deal["status"] = "canceled_after_sign" if old_status == "sold" else "canceled"
+        deal["canceled_at"] = _now_utc().isoformat()
+        _save_deals(DEALS_DATA)
+
+        embed = discord.Embed(
+            title="⚠️ Deal Canceled",
+            color=0xe67e22,
+            description=f"Customer: **{deal['customer_name']}**",
+        )
+        embed.add_field(
+            name="Closer",
+            value=_display_name(deal.get("closer_id"), deal.get("closer_name", "Unknown")),
+            inline=True,
+        )
+        if deal.get("setter_name"):
+            embed.add_field(
+                name="Setter",
+                value=_display_name(deal.get("setter_id"), deal["setter_name"]),
+                inline=True,
+            )
+        if deal.get("kw"):
+            embed.add_field(name="System Size", value=f"{deal['kw']:.1f} kW", inline=True)
+        embed.set_footer(text=f"Deal #{deal['id']}")
+        await message.channel.send(embed=embed)
+        await _post_today_leaderboards(message.guild)
+        return
+
+    # ----------------------------------------------------------------
+    # #delete <ID> or #delete Customer Name   (admin/manager only)
     # ----------------------------------------------------------------
     if lower.startswith("#delete"):
         if not _is_admin_or_manager(message.author):
@@ -852,11 +1170,10 @@ async def on_message(message: discord.Message):
         try:
             parts = content.split(maxsplit=1)
             if len(parts) < 2:
-                raise ValueError
+                raise ValueError("Missing target")
             target = parts[1].strip()
 
             deal = None
-            # Try to parse as deal ID first
             try:
                 deal_id = int(target)
                 deal = _find_deal_by_id(message.guild.id, deal_id)
@@ -864,7 +1181,6 @@ async def on_message(message: discord.Message):
                     await message.channel.send(f"❌ No deal found with ID `{deal_id}`.")
                     return
             except (ValueError, TypeError):
-                # Not a number — treat as customer name
                 deal = _find_latest_deal_by_customer(message.guild.id, target)
                 if not deal:
                     await message.channel.send(f"❌ No deal found for `{target}`.")
@@ -874,7 +1190,7 @@ async def on_message(message: discord.Message):
                 f"Deal #{deal['id']} — "
                 f"Closer: {deal.get('closer_name', '?')}, "
                 f"Setter: {deal.get('setter_name', '?')}, "
-                f"{deal['kw']:.1f} kW"
+                f"{deal.get('kw', 0):.1f} kW"
             )
 
             DEALS_DATA["deals"] = [d for d in DEALS_DATA["deals"] if d["id"] != deal["id"]]
@@ -907,16 +1223,13 @@ async def on_message(message: discord.Message):
 
 
 # ---------------------------------------------------------------
-# Slash-style ! commands
+# ! Commands
 # ---------------------------------------------------------------
 
 
 @bot.command(name="deals")
 async def deals_cmd(ctx: commands.Context, period: str = "day", date_str: str | None = None):
-    """
-    !deals [day|week|month] [YYYY-MM-DD]
-    List all deals with their IDs so admins can reference/delete them.
-    """
+    """!deals [day|week|month|all] - List all deals with their IDs."""
     if not ctx.guild:
         await ctx.send("This command only works in a server.")
         return
@@ -956,25 +1269,22 @@ async def deals_cmd(ctx: commands.Context, period: str = "day", date_str: str | 
         await ctx.send(f"No deals found for **{date_label}**.")
         return
 
-    # Build a compact table
     lines = [f"**{pretty}** — {date_label}\n"]
-    lines.append("`ID  | Type     | Closer         | Setter         | kW    | Status`")
-    lines.append("`----|----------|----------------|----------------|-------|--------`")
+    lines.append("`ID  | Status   | Closer         | Setter         | kW    `")
+    lines.append("`----|----------|----------------|----------------|-------`")
 
     for d in guild_deals:
         did = d["id"]
-        dtype = "Solar" if d.get("deal_type", "solar_battery") == "solar_battery" else "Batt"
+        status = d.get("status", "sold")
+        status_short = {"sold": "✅ Sold", "set": "🟡 Set", "no_sale": "🚫 NoSale", 
+                       "canceled": "❌ Cancel", "canceled_after_sign": "❌ Cancel"}.get(status, status)
         closer = (d.get("closer_name") or "?")[:14]
         setter = (d.get("setter_name") or "?")[:14]
-        kw = f"{d['kw']:.1f}"
-        status = d.get("status", "closed")
-        status_short = {"closed": "✅", "canceled": "❌", "deleted": "🗑️"}.get(status, status)
-        lines.append(f"`{did:<4}| {dtype:<8} | {closer:<14} | {setter:<14} | {kw:<5} | {status_short}`")
+        kw = f"{d.get('kw', 0):.1f}" if d.get("kw") else "-"
+        lines.append(f"`{did:<4}| {status_short:<8} | {closer:<14} | {setter:<14} | {kw:<5}`")
 
-    # Discord messages have a 2000 char limit
     msg = "\n".join(lines)
     if len(msg) > 1900:
-        # Send in chunks
         chunk = ""
         for line in lines:
             if len(chunk) + len(line) + 1 > 1900:
@@ -989,15 +1299,11 @@ async def deals_cmd(ctx: commands.Context, period: str = "day", date_str: str | 
 
 @bot.command(name="leaderboard")
 async def leaderboard_cmd(ctx: commands.Context, period: str = "day", date_str: str | None = None):
-    """
-    !leaderboard [day|week|month] [YYYY-MM-DD]
-    Admin only - shows @mentions for everyone on the board.
-    """
+    """!leaderboard [day|week|month] - Admin only, shows @mentions."""
     if not ctx.guild:
         await ctx.send("This command only works in a server.")
         return
 
-    # Admin only
     if not _is_admin_or_manager(ctx.author):
         await ctx.send("⛔ Only admins or managers can use `!leaderboard`.")
         return
@@ -1026,18 +1332,13 @@ async def leaderboard_cmd(ctx: commands.Context, period: str = "day", date_str: 
     else:
         date_label = f"{start_local.date()} → {(end_local - timedelta(days=1)).date()}"
 
-    # Always use @mentions since only admins can use this command
     embed = _build_leaderboard_embed(ctx.guild, deals, pretty, date_label, use_mentions=True)
     await ctx.send(embed=embed)
 
 
 @bot.command(name="mystats")
 async def mystats_cmd(ctx: commands.Context, period: str = "alltime"):
-    """
-    !mystats [day|week|month|alltime]
-    Shows stats where user is closer OR setter.
-    Works for both closers and setters!
-    """
+    """!mystats [day|week|month|alltime] - Your personal stats."""
     if not ctx.guild:
         await ctx.send("This command only works in a server.")
         return
@@ -1051,11 +1352,9 @@ async def mystats_cmd(ctx: commands.Context, period: str = "alltime"):
     user_name = ctx.author.display_name
 
     if period in ("alltime", "all"):
-        # All time stats
         deals = _get_user_deals(ctx.guild.id, user_id, user_name)
         period_label = "All Time"
     else:
-        # Period-based stats
         base_dt = _now_local()
         start_utc, end_utc, start_local, end_local, _ = _period_bounds(period, base_dt)
         deals = _get_user_deals_period(ctx.guild.id, user_id, user_name, start_utc, end_utc)
@@ -1064,107 +1363,306 @@ async def mystats_cmd(ctx: commands.Context, period: str = "alltime"):
             period_label = f"Today ({start_local.date().isoformat()})"
         elif period in ("week", "thisweek"):
             period_label = f"This Week ({start_local.date()} → {(end_local - timedelta(days=1)).date()})"
-        else:  # month
+        else:
             period_label = f"This Month ({start_local.strftime('%Y-%m')})"
 
-    total_deals = len(deals)
-    total_kw = sum(float(d.get("kw") or 0.0) for d in deals)
-    solar_deals, battery_deals = _split_by_type(deals)
-
-    # Count deals where user was closer vs setter
-    closer_deals = [d for d in deals if d.get("closer_id") == user_id]
-    setter_deals = [d for d in deals if d.get("setter_id") == user_id or
+    # Calculate stats
+    sold_deals = [d for d in deals if d.get("status") == "sold"]
+    set_deals = [d for d in deals if d.get("status") in ("set", "no_sale", "sold", "canceled_after_sign") and d.get("setter_id") == user_id]
+    no_sale_deals = [d for d in deals if d.get("status") == "no_sale" and d.get("closer_id") == user_id]
+    canceled_deals = [d for d in deals if d.get("status") == "canceled_after_sign" and d.get("closer_id") == user_id]
+    
+    closer_deals = [d for d in sold_deals if d.get("closer_id") == user_id]
+    setter_deals = [d for d in sold_deals if d.get("setter_id") == user_id or
                    (d.get("setter_name", "").lower().strip() == user_name.lower().strip() and d.get("closer_id") != user_id)]
+
+    total_kw = sum(float(d.get("kw") or 0.0) for d in closer_deals)
+    total_rev = sum(_compute_revenue(float(d.get("kw") or 0.0)) or 0.0 for d in closer_deals)
+    
+    # Close rate
+    appts_set = len(set_deals)
+    close_rate = (len(closer_deals) / appts_set * 100) if appts_set > 0 else 0.0
+    
+    # Loss reason breakdown
+    loss_counts: Dict[str, int] = {}
+    for d in no_sale_deals:
+        code = d.get("loss_reason") or "other"
+        loss_counts[code] = loss_counts.get(code, 0) + 1
 
     embed = discord.Embed(
         title=f"📊 Stats for {ctx.author.display_name}",
         description=f"**{period_label}**",
         color=0x3498db,
     )
-    embed.add_field(name="Total Deals", value=str(total_deals), inline=True)
-    embed.add_field(name="Total kW", value=f"{total_kw:.1f}", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)  # Spacer
+    
+    embed.add_field(name="📞 Appointments Set", value=str(appts_set), inline=True)
+    embed.add_field(name="✅ Deals Closed", value=str(len(closer_deals)), inline=True)
+    embed.add_field(name="📈 Close Rate", value=f"{close_rate:.1f}%", inline=True)
+    
+    embed.add_field(name="🚫 No-sales", value=str(len(no_sale_deals)), inline=True)
+    embed.add_field(name="❌ Canceled", value=str(len(canceled_deals)), inline=True)
+    embed.add_field(name="⚡ Total kW", value=f"{total_kw:.1f}", inline=True)
 
-    if closer_deals:
-        closer_kw = sum(float(d.get("kw") or 0.0) for d in closer_deals)
-        embed.add_field(name="💼 As Closer", value=f"{len(closer_deals)} deals ({closer_kw:.1f} kW)", inline=True)
-
+    if CONFIG_DATA.get("revenue_enabled"):
+        embed.add_field(name="💰 Est. Revenue", value=f"${total_rev:,.2f}", inline=True)
+    
     if setter_deals:
         setter_kw = sum(float(d.get("kw") or 0.0) for d in setter_deals)
-        embed.add_field(name="📋 As Setter", value=f"{len(setter_deals)} deals ({setter_kw:.1f} kW)", inline=True)
+        embed.add_field(name="📋 As Setter (Sold)", value=f"{len(setter_deals)} deals ({setter_kw:.1f} kW)", inline=True)
 
-    if solar_deals:
-        embed.add_field(name="☀️🔋 Solar+Battery", value=str(len(solar_deals)), inline=True)
-    if battery_deals:
-        embed.add_field(name="🔋 Battery Only", value=str(len(battery_deals)), inline=True)
+    # Loss breakdown
+    if loss_counts:
+        breakdown_lines = []
+        total_losses = sum(loss_counts.values())
+        for code, count in loss_counts.items():
+            label = LOSS_REASON_LABELS.get(code, code.title())
+            pct = (count / total_losses) * 100 if total_losses else 0
+            breakdown_lines.append(f"**{label}** – {count} ({pct:.0f}%)")
+        embed.add_field(
+            name="🧠 No-sale Breakdown",
+            value="\n".join(breakdown_lines) if breakdown_lines else "None",
+            inline=False,
+        )
 
     embed.set_footer(text="Usage: !mystats [day|week|month|alltime]")
     await ctx.send(embed=embed)
 
 
+@bot.command(name="todaystats")
+async def today_stats_cmd(ctx: commands.Context):
+    """!todaystats - Today's team performance."""
+    if not ctx.guild:
+        await ctx.send("This command only works in a server.")
+        return
+
+    now = _now_local()
+    start_utc, end_utc, _, _, _ = _period_bounds("day", now)
+    deals = _filter_deals_period(ctx.guild.id, start_utc, end_utc, include_canceled=True)
+
+    sets = len([d for d in deals if d.get("status") in ("set", "no_sale")])
+    sold = len([d for d in deals if d.get("status") == "sold"])
+    total_kw = sum(float(d.get("kw") or 0.0) for d in deals if d.get("status") == "sold")
+    total_rev = sum(_compute_revenue(float(d.get("kw") or 0.0)) or 0.0 for d in deals if d.get("status") == "sold")
+
+    embed = discord.Embed(
+        title="📅 Today's Performance",
+        color=discord.Color.green(),
+        timestamp=_now_utc(),
+    )
+    embed.add_field(name="📞 Appointments Set", value=str(sets), inline=True)
+    embed.add_field(name="✅ Deals Closed", value=str(sold), inline=True)
+    embed.add_field(name="⚡ Total kW", value=f"{total_kw:.1f}", inline=True)
+    if CONFIG_DATA.get("revenue_enabled"):
+        embed.add_field(name="💰 Est. Revenue", value=f"${total_rev:,.2f}", inline=True)
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="pendingdeals")
+async def pending_deals_cmd(ctx: commands.Context):
+    """!pendingdeals - Show appointments waiting to be closed."""
+    if not ctx.guild:
+        await ctx.send("This command only works in a server.")
+        return
+
+    pending = [d for d in _get_guild_deals(ctx.guild.id) if d.get("status") == "set"]
+    if not pending:
+        await ctx.send("✅ No pending appointments!")
+        return
+
+    embed = discord.Embed(
+        title="🔔 Pending Appointments",
+        description=f"{len(pending)} appointment(s) waiting to be closed",
+        color=discord.Color.orange(),
+        timestamp=_now_utc(),
+    )
+
+    for d in sorted(pending, key=lambda x: x.get("created_at", ""))[:10]:
+        created = d.get("created_at")
+        try:
+            created_str = datetime.fromisoformat(created).strftime("%m/%d %H:%M")
+        except Exception:
+            created_str = "N/A"
+        embed.add_field(
+            name=f"{d.get('customer_name', 'Unknown')}",
+            value=f"Setter: {d.get('setter_name', 'Unknown')}\nCreated: {created_str}",
+            inline=True,
+        )
+
+    if len(pending) > 10:
+        embed.set_footer(text=f"Showing 10 of {len(pending)} pending deals")
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="export_csv")
+async def export_csv_cmd(ctx: commands.Context, period: str = "all"):
+    """!export_csv [day|week|month|all] - Export deals to CSV (admin only)."""
+    if not ctx.guild:
+        await ctx.send("This command only works in a server.")
+        return
+
+    if not _is_admin_or_manager(ctx.author):
+        await ctx.send("⛔ Only admins or managers can export data.")
+        return
+
+    period = period.lower()
+    now = _now_local()
+    
+    if period == "all":
+        guild_deals = _get_guild_deals(ctx.guild.id)
+    else:
+        start_utc, end_utc, _, _, _ = _period_bounds(period, now)
+        guild_deals = _filter_deals_period(ctx.guild.id, start_utc, end_utc, include_canceled=True)
+
+    filename = f"/tmp/deals_{period}_{int(_now_utc().timestamp())}.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Deal ID", "Customer", "Setter", "Closer", "Status", "kW",
+            "Revenue", "Loss Reason", "Created At", "Closed At", "Canceled At"
+        ])
+
+        for d in guild_deals:
+            kw = float(d.get("kw") or 0.0)
+            rev = _compute_revenue(kw) or 0.0
+            writer.writerow([
+                d.get("id"),
+                d.get("customer_name"),
+                d.get("setter_name"),
+                d.get("closer_name"),
+                d.get("status"),
+                kw if kw else "",
+                rev if rev else "",
+                d.get("loss_reason_detail") or d.get("loss_reason") or "",
+                d.get("created_at") or "",
+                d.get("closed_at") or "",
+                d.get("canceled_at") or "",
+            ])
+
+    await ctx.send(
+        f"📁 Exported {len(guild_deals)} deals for **{period}**.",
+        file=discord.File(filename, filename=os.path.basename(filename)),
+    )
+
+
+@bot.command(name="set_revenue")
+async def set_revenue_cmd(ctx: commands.Context, value: str = None):
+    """!set_revenue [off|amount] - Enable/disable revenue tracking (admin only)."""
+    if not ctx.guild:
+        await ctx.send("This command only works in a server.")
+        return
+
+    if not _is_admin_or_manager(ctx.author):
+        await ctx.send("⛔ Only admins or managers can configure revenue.")
+        return
+
+    if not value:
+        status = "enabled" if CONFIG_DATA.get("revenue_enabled") else "disabled"
+        per_kw = CONFIG_DATA.get("revenue_per_kw", 0)
+        await ctx.send(f"💰 Revenue is currently **{status}** at ${per_kw:.2f} per kW.\n"
+                      f"Use `!set_revenue off` or `!set_revenue 400` to change.")
+        return
+
+    value = value.lower()
+    if value in {"off", "0", "none", "disable"}:
+        CONFIG_DATA["revenue_enabled"] = False
+        CONFIG_DATA["revenue_per_kw"] = 0.0
+        _save_config(CONFIG_DATA)
+        await ctx.send("💸 Revenue display has been **disabled**.")
+        return
+
+    try:
+        kw_value = float(value)
+    except ValueError:
+        await ctx.send("❌ Usage: `!set_revenue off` or `!set_revenue 400` (meaning $400 per kW).")
+        return
+
+    CONFIG_DATA["revenue_enabled"] = True
+    CONFIG_DATA["revenue_per_kw"] = kw_value
+    _save_config(CONFIG_DATA)
+    await ctx.send(f"💸 Revenue enabled at **${kw_value:.2f} per kW**.")
+
+
+@bot.command(name="set_ghl")
+async def set_ghl_cmd(ctx: commands.Context, webhook_url: str = None):
+    """!set_ghl [webhook_url|off] - Configure GHL webhook (admin only)."""
+    if not ctx.guild:
+        await ctx.send("This command only works in a server.")
+        return
+
+    if not _is_admin_or_manager(ctx.author):
+        await ctx.send("⛔ Only admins or managers can configure GHL.")
+        return
+
+    if not webhook_url:
+        status = "enabled" if CONFIG_DATA.get("ghl_enabled") else "disabled"
+        await ctx.send(f"🔗 GHL webhook is currently **{status}**.\n"
+                      f"Use `!set_ghl <webhook_url>` or `!set_ghl off` to change.")
+        return
+
+    if webhook_url.lower() in {"off", "disable", "none"}:
+        CONFIG_DATA["ghl_enabled"] = False
+        CONFIG_DATA["ghl_webhook"] = None
+        _save_config(CONFIG_DATA)
+        await ctx.send("🔗 GHL webhook has been **disabled**.")
+        return
+
+    CONFIG_DATA["ghl_enabled"] = True
+    CONFIG_DATA["ghl_webhook"] = webhook_url
+    _save_config(CONFIG_DATA)
+    await ctx.send("🔗 GHL webhook has been **enabled**. Events will be sent to your webhook.")
+
+
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
     embed = discord.Embed(
-        title="☀️ Solar Leaderboard Bot – Commands",
+        title="📊 Deal Tracker – Command Guide",
         color=0x95a5a6,
         description=(
-            "Log sales with hashtags in **general chat**, "
-            "use `!` commands for reports.\n"
+            "Track appointments, deals, no-sales, and leaderboards.\n"
             "_All times in Central Time._"
         ),
     )
 
     embed.add_field(
-        name="Log a Sale",
+        name="📝 Hashtag Workflows",
         value=(
-            "`#sold @Setter kW` — Solar + Battery\n"
-            "`#sold @Setter 0` — Battery Only\n"
-            "• Example: `#sold @Devin 6.5`\n"
-            "• With customer: `#sold @Devin John Smith 6.5`"
+            "`#set Customer Name` — Log an appointment\n"
+            "`#sold @Setter kW` — Log a sold deal\n"
+            "`#sold Customer Name kW` — Close a pending appointment\n"
+            "`#nosale Customer Name` — Mark as no-sale\n"
+            "`#cancel Customer Name` — Cancel a deal\n"
+            "`#delete <ID>` — Delete a deal (admin)"
         ),
         inline=False,
     )
 
     embed.add_field(
-        name="Admin: Log for Someone Else",
+        name="📊 Stats & Leaderboards",
         value=(
-            "`#soldfor @Closer @Setter kW`\n"
-            "• Example: `#soldfor @Ethen @Devin 6.5`"
+            "`!mystats [day|week|month|alltime]` — Your stats\n"
+            "`!todaystats` — Today's team performance\n"
+            "`!pendingdeals` — Appointments waiting to close\n"
+            "`!leaderboard [day|week|month]` — Team rankings (admin)"
         ),
         inline=False,
     )
 
     embed.add_field(
-        name="Cancel / Delete",
+        name="🔧 Admin Tools",
         value=(
-            "`#cancel Customer Name` — mark as canceled\n"
-            "`#delete <DealID>` — delete by deal number\n"
-            "`#delete Customer Name` — delete by customer name\n"
-            "• Use `!deals` to see all deal IDs"
+            "`!deals [day|week|month|all]` — List all deals with IDs\n"
+            "`!export_csv [period]` — Export to spreadsheet\n"
+            "`!set_revenue [off|amount]` — Configure $ per kW\n"
+            "`!set_ghl [webhook_url|off]` — Configure GHL webhook\n"
+            "`#soldfor @Closer @Setter kW` — Log for others\n"
+            "`#clearleaderboard` — Wipe all deals"
         ),
         inline=False,
     )
 
-    embed.add_field(
-        name="View Deals & Leaderboards",
-        value=(
-            "`!deals [day|week|month|all]` — list deals with IDs\n"
-            "`!leaderboard [day|week|month] [YYYY-MM-DD]`\n"
-            "`!mystats` — your all-time stats\n"
-            "`!mystats day` — today's stats\n"
-            "`!mystats week` — this week's stats\n"
-            "`!mystats month` — this month's stats"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="Admin: Reset",
-        value="`#clearleaderboard` — wipes all deals for this server",
-        inline=False,
-    )
-
-    embed.set_footer(text="Leaderboard channels are read-only – use #sold in your normal chat.")
+    embed.set_footer(text="Leaderboard channels update automatically with each sale.")
     await ctx.send(embed=embed)
 
 
