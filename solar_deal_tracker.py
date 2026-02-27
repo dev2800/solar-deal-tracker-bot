@@ -1102,6 +1102,66 @@ async def mystats_cmd(ctx: commands.Context, period: str = "alltime"):
     await ctx.send(embed=embed)
 
 
+@bot.command(name="setupchannels")
+async def setup_channels_cmd(ctx: commands.Context):
+    """!setupchannels - Admin only, creates the leaderboard channels."""
+    if not ctx.guild:
+        await ctx.send("This command only works in a server.")
+        return
+
+    if not _is_admin_or_manager(ctx.author):
+        await ctx.send("⛔ Only admins or managers can use `!setupchannels`.")
+        return
+
+    await ctx.send("🔧 Creating leaderboard channels...")
+    
+    try:
+        bot_member = ctx.guild.me
+        everyone = ctx.guild.default_role
+
+        overwrites = {
+            everyone: discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False,
+                add_reactions=False,
+                create_public_threads=False,
+                create_private_threads=False,
+            ),
+            bot_member: discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+                embed_links=True,
+                manage_messages=True,
+            ),
+        }
+
+        created = []
+        existing = []
+        
+        for name, topic in LEADERBOARD_CHANNELS.items():
+            chan = discord.utils.get(ctx.guild.text_channels, name=name)
+            if chan is None:
+                await ctx.guild.create_text_channel(name, topic=topic, overwrites=overwrites)
+                created.append(name)
+            else:
+                existing.append(name)
+        
+        msg = ""
+        if created:
+            msg += f"✅ Created: {', '.join(created)}\n"
+        if existing:
+            msg += f"ℹ️ Already existed: {', '.join(existing)}"
+        
+        await ctx.send(msg if msg else "✅ All channels ready!")
+        
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have permission to create channels. Please give me the 'Manage Channels' permission.")
+    except Exception as e:
+        await ctx.send(f"❌ Error creating channels: {e}")
+
+
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
     embed = discord.Embed(
